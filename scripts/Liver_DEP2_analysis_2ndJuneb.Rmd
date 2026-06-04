@@ -1,0 +1,2371 @@
+---
+title: "Liver proteomics analysis using DEP2"
+author: "Ellen Mazalale"
+date: "06022026"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+## Load packages and define analysis-wide settings.
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(SummarizedExperiment)
+  library(DEP2)
+  library(limma)
+  library(vsn)
+  library(ggplot2)
+  library(pheatmap)
+  library(grid)
+})
+
+pg_file <- "merged_pg_matrix.tsv"
+meta_file <- "merged_sample_metadata.csv"
+
+OUT_DIR <- "liver_DEP2_outputs"
+dir.create(OUT_DIR, showWarnings = FALSE)
+
+MIN_DETECT_FRAC <- 0.50
+FDR_CUTOFF <- 0.05
+
+set.seed(1)
+```
+
+# Analysis objective
+
+This analysis subsets the merged proteomics data to liver samples only and uses DEP2 for protein identifier handling, SummarizedExperiment construction, missing-value filtering, VSN normalization, imputation, and quality control. The downstream modeling is performed on the DEP2-processed abundance matrix using limma so that age, environment, sex, and the age-by-environment interaction can be evaluated directly. The main biological goal is to determine whether liver aging from 8 to 18 weeks is detectable in laboratory and mesocosm environments, whether the direction or magnitude of aging differs between environments, and whether any dominant biological pattern, such as ribosomal remodeling, emerges from the age-associated proteins.
+
+# 1. Load raw matrix and metadata
+
+```{r load-data}
+## Load balanced liver dataset.
+
+meta_liver <- readr::read_csv(
+  "liver_met_2.csv",
+  show_col_types = FALSE
+)
+
+mat_liver <- readr::read_csv(
+  "liver_mat_2.csv",
+  show_col_types = FALSE
+)
+
+cat("Metadata dimensions:", dim(meta_liver), "\n")
+cat("Matrix dimensions:", dim(mat_liver), "\n")
+
+table(meta_liver$group_name)
+```
+
+
+```{r}
+## Extract protein annotation and abundance matrix.
+
+protein_info <- mat_liver[, 1:6]
+
+abundance_mat <- mat_liver %>%
+  dplyr::select(-(1:6)) %>%
+  as.matrix()
+
+rownames(abundance_mat) <- protein_info$Protein.Group
+
+cat("Abundance matrix dimensions:", dim(abundance_mat), "\n")
+
+head(rownames(abundance_mat))
+head(colnames(abundance_mat))
+```
+
+
+
+```{r}
+dim(abundance_mat)
+
+head(colnames(abundance_mat))
+
+head(rownames(abundance_mat))
+```
+
+
+
+```{r}
+## Create liver sample metadata in the same order as abundance matrix.
+
+sample_meta <- meta_liver %>%
+  dplyr::select(
+    sample_column,
+    group_name,
+    tissue,
+    age,
+    environment,
+    sex
+  ) %>%
+  dplyr::filter(sample_column %in% colnames(abundance_mat)) %>%
+  dplyr::arrange(match(sample_column, colnames(abundance_mat))) %>%
+  as.data.frame()
+
+rownames(sample_meta) <- sample_meta$sample_column
+head(sample_meta)
+```
+
+
+```{r}
+## Create SummarizedExperiment object.
+
+library(SummarizedExperiment)
+
+data_se <- SummarizedExperiment(
+  assays = list(abundance = abundance_mat),
+  colData = sample_meta
+)
+
+data_se
+```
+
+
+```{r}
+dim(data_se)
+table(colData(data_se)$group_name)
+```
+
+
+
+```{r}
+## Create the liver-specific protein matrix.
+
+sample_cols_liver <- exp_design_liver$label
+
+mat_liver <- mat_raw %>%
+  dplyr::select(
+    Protein.Group,
+    Protein.Names,
+    Genes,
+    First.Protein.Description,
+    N.Sequences,
+    N.Proteotypic.Sequences,
+    dplyr::all_of(sample_cols_liver)
+  )
+
+cat("liver matrix dimensions:", dim(mat_liver), "\n")
+
+cat(
+  "Sample columns match experimental design:",
+  setequal(
+    sample_cols_liver,
+    colnames(mat_liver)[-(1:6)]
+  ),
+  "\n"
+)
+```
+
+
+```{r}
+## Remove protein groups with no quantified values in any liver sample.
+
+keep_liver_proteins <- rowSums(
+  !is.na(mat_liver[, sample_cols_liver])
+) > 0
+
+cat("Proteins before removing all-missing liver rows:", nrow(mat_liver), "\n")
+cat("Proteins detected in at least one liver sample:", sum(keep_liver_proteins), "\n")
+cat("Proteins absent from all liver samples:", sum(!keep_liver_proteins), "\n")
+
+mat_liver <- mat_liver[keep_liver_proteins, ]
+
+cat("liver matrix after removing all-missing rows:", dim(mat_liver), "\n")
+```
+
+
+```{r}
+## Prepare protein identifiers for DEP2 by creating clean gene names and unique protein IDs.
+
+mat_dep <- mat_liver %>%
+  dplyr::mutate(
+    Genes_clean = ifelse(
+      is.na(Genes) | Genes == "",
+      Protein.Group,
+      Genes
+    )
+  )
+
+data_unique <- make_unique(
+  mat_dep,
+  names = "Genes_clean",
+  ids = "Protein.Group",
+  delim = ";"
+)
+
+cat("Input liver proteins:", nrow(mat_dep), "\n")
+cat("Unique proteins after make_unique:", nrow(data_unique), "\n")
+cat("Missing names after cleanup:", sum(is.na(data_unique$name) | data_unique$name == ""), "\n")
+cat("Missing IDs after cleanup:", sum(is.na(data_unique$ID) | data_unique$ID == ""), "\n")
+```
+
+
+```{r}
+group_factor <- colData(data_se)$group_name
+
+keep_bal <- apply(
+  assay(data_se),
+  1,
+  function(x) {
+    any(
+      tapply(!is.na(x), group_factor, mean) >= 0.50
+    )
+  }
+)
+
+data_filt_bal <- data_se[keep_bal, ]
+
+dim(data_filt_bal)
+```
+
+
+##Just checking
+```{r}
+dim(data_se)
+dim(data_filt_bal)
+ncol(data_se)
+
+```
+
+
+
+
+```{r}
+## Summarize protein completeness before DEP2 filtering.
+
+det_counts <- rowSums(!is.na(assay(data_se)))
+
+summary(det_counts)
+
+cat(
+  "Proteins detected in all 38 samples:",
+  sum(det_counts == 38),
+  "\n"
+)
+
+cat(
+  "Proteins detected in at least 50% of samples:",
+  sum(det_counts >= 19),
+  "\n"
+)
+
+cat(
+  "Proteins detected in only one sample:",
+  sum(det_counts == 1),
+  "\n"
+)
+```
+
+
+```{r}
+## Filter proteins based on replicate completeness within conditions.
+
+data_filt_bal <- filter_se(
+  data_se,
+  thr = MIN_DETECT_FRAC
+)
+
+cat("Proteins before filtering:", nrow(data_se), "\n")
+cat("Proteins after filtering:", nrow(data_filt_bal), "\n")
+cat("Proteins removed:", nrow(data_se) - nrow(data_filt_bal), "\n")
+```
+
+
+```{r}
+## Examine how many proteins were retained by DEP filtering.
+
+cat(
+  "Percent retained:",
+  round(100 * nrow(data_filt_bal) / nrow(data_se), 1),
+  "%\n"
+)
+
+cat(
+  "Percent removed:",
+  round(100 * (nrow(data_se) - nrow(data_filt_bal)) / nrow(data_se), 1),
+  "%\n"
+)
+```
+
+
+```{r}
+## Apply variance stabilizing normalization (VSN).
+
+data_norm <- normalize_vsn(data_filt_bal)
+
+cat("Proteins after normalization:", nrow(data_norm), "\n")
+cat("Samples after normalization:", ncol(data_norm), "\n")
+```
+
+
+```{r}
+## Visualize sample intensity distributions after VSN normalization.
+
+plot_normalization(data_norm)
+```
+
+
+
+```{r}
+## Quantify missing values before imputation.
+
+miss_by_sample <- data.frame(
+  sample = colnames(assay(data_norm)),
+  frac_missing = colMeans(is.na(assay(data_norm)))
+)
+
+summary(miss_by_sample$frac_missing)
+
+cat(
+  "Mean sample missingness:",
+  round(mean(miss_by_sample$frac_missing) * 100, 1),
+  "%\n"
+)
+
+cat(
+  "Maximum sample missingness:",
+  round(max(miss_by_sample$frac_missing) * 100, 1),
+  "%\n"
+)
+```
+
+
+```{r}
+## Identify samples with the highest missingness.
+
+miss_by_sample %>%
+  dplyr::arrange(desc(frac_missing)) %>%
+  head(10)
+```
+
+
+
+
+```{r}
+## Create a metadata table using the DEP2 sample names.
+
+sample_meta <- as.data.frame(colData(data_norm))
+sample_meta$sample <- rownames(sample_meta)
+
+head(sample_meta[, c("sample", "condition", "sex", "age", "environment")])
+```
+
+
+```{r}
+## Compare missingness by sex using DEP2 sample names.
+
+miss_by_sample <- data.frame(
+  sample = colnames(assay(data_norm)),
+  frac_missing = colMeans(is.na(assay(data_norm)))
+)
+
+sample_meta <- as.data.frame(colData(data_norm))
+sample_meta$sample <- rownames(sample_meta)
+
+miss_by_sample <- miss_by_sample %>%
+  dplyr::left_join(
+    sample_meta %>%
+      dplyr::select(sample, condition, sex, age, environment),
+    by = "sample"
+  )
+
+miss_by_sample %>%
+  dplyr::group_by(sex) %>%
+  dplyr::summarise(
+    mean_missing = mean(frac_missing),
+    sd_missing = sd(frac_missing),
+    n = dplyr::n()
+  )
+```
+
+
+```{r}
+## Visualize missingness by sex and environment.
+
+ggplot(
+  miss_by_sample,
+  aes(x = sex, y = frac_missing, fill = environment)
+) +
+  geom_boxplot(outlier.alpha = 0.4) +
+  geom_jitter(
+    width = 0.15,
+    size = 2,
+    alpha = 0.8
+  ) +
+  theme_bw() +
+  labs(
+    title = "Missingness in liver proteome by sex and environment",
+    x = NULL,
+    y = "Fraction missing"
+  )
+```
+
+
+```{r}
+## Mean missingness by sex and environment.
+
+miss_by_sample %>%
+  group_by(sex, environment) %>%
+  summarise(
+    mean_missing = mean(frac_missing),
+    sd_missing = sd(frac_missing),
+    n = n(),
+    .groups = "drop"
+  )
+```
+
+
+```{r}
+## Number of quantified proteins per sample after DEP filtering.
+
+detected_per_sample <- colSums(!is.na(assay(data_filt_bal)))
+
+det_df <- data.frame(
+  sample = names(detected_per_sample),
+  detected = detected_per_sample
+) %>%
+  left_join(
+    sample_meta %>%
+      dplyr::select(sample, sex, age, environment),
+    by = "sample"
+  )
+
+det_df %>%
+  group_by(sex) %>%
+  summarise(
+    mean_detected = mean(detected),
+    sd_detected = sd(detected),
+    min_detected = min(detected),
+    max_detected = max(detected),
+    n = n(),
+    .groups = "drop"
+  )
+```
+
+
+
+```{r}
+## Impute missing values using DEP2's MinProb method.
+
+data_imp <- impute(
+  data_norm,
+  fun = "MinProb",
+  q = 0.01
+)
+
+cat("Proteins after imputation:", nrow(data_imp), "\n")
+cat("Samples after imputation:", ncol(data_imp), "\n")
+
+cat(
+  "Remaining missing values:",
+  sum(is.na(assay(data_imp))),
+  "\n"
+)
+```
+
+
+
+```{r}
+## Visualize intensity distributions after normalization and after imputation.
+
+par(mfrow = c(1, 2))
+
+boxplot(
+  assay(data_norm),
+  outline = FALSE,
+  las = 2,
+  main = "After VSN normalization",
+  ylab = "Log2 intensity"
+)
+
+boxplot(
+  assay(data_imp),
+  outline = FALSE,
+  las = 2,
+  main = "After MinProb imputation",
+  ylab = "Log2 intensity"
+)
+
+par(mfrow = c(1, 1))
+```
+
+
+```{r}
+## Density distributions before and after imputation.
+
+par(mfrow = c(1, 2))
+
+plot(
+  density(assay(data_norm)[, 1], na.rm = TRUE),
+  main = "VSN normalized",
+  xlab = "Log2 intensity"
+)
+
+for(i in 2:ncol(assay(data_norm))) {
+  lines(
+    density(assay(data_norm)[, i], na.rm = TRUE),
+    col = rgb(0, 0, 0, 0.2)
+  )
+}
+
+plot(
+  density(assay(data_imp)[, 1]),
+  main = "After MinProb imputation",
+  xlab = "Log2 intensity"
+)
+
+for(i in 2:ncol(assay(data_imp))) {
+  lines(
+    density(assay(data_imp)[, i]),
+    col = rgb(0, 0, 0, 0.2)
+  )
+}
+
+par(mfrow = c(1, 1))
+```
+
+
+
+```{r}
+## PCA using all filtered proteins after normalization and imputation.
+
+mat_pca <- assay(data_imp)
+
+pca_all <- prcomp(
+  t(mat_pca),
+  center = TRUE,
+  scale. = TRUE
+)
+
+pca_var_all <- round(
+  100 * (pca_all$sdev^2 / sum(pca_all$sdev^2)),
+  1
+)
+
+pca_var_all[1:5]
+```
+
+
+```{r}
+## PCA dataframe from imputed liver data.
+
+pca_df <- as.data.frame(pca_all$x[, 1:2]) %>%
+  tibble::rownames_to_column("sample_id") %>%
+  dplyr::bind_cols(
+    as.data.frame(colData(data_imp)) %>%
+      dplyr::select(-sample)
+  )
+
+head(
+  pca_df[, c("sample_id", "sex", "age", "environment")]
+)
+```
+
+
+```{r}
+## Inspect PCA metadata columns using the available sample column name.
+
+head(
+  pca_df[, c("sample_id", "sex", "age", "environment")]
+)
+```
+
+
+```{r}
+## PCA coloured by sex and shaped by environment.
+
+ggplot(
+  pca_df,
+  aes(
+    PC1,
+    PC2,
+    color = sex,
+    shape = environment
+  )
+) +
+  geom_point(size = 4) +
+  geom_text(
+    aes(label = gsub("wk", "", age)),
+    vjust = -0.8,
+    size = 4
+  ) +
+  theme_bw() +
+  labs(
+    title = "liver PCA after filtering, VSN normalization and imputation",
+    x = paste0("PC1 (", pca_var_all[1], "%)"),
+    y = paste0("PC2 (", pca_var_all[2], "%)")
+  )
+```
+ 
+
+
+```{r}
+## Mean PC2 score by age.
+
+pca_df %>%
+  dplyr::group_by(age) %>%
+  dplyr::summarise(
+    mean_PC2 = mean(PC2),
+    sd_PC2 = sd(PC2),
+    n = dplyr::n()
+  )
+```
+
+
+```{r}
+aggregate(
+  cbind(PC1, PC2) ~ environment,
+  data = pca_df,
+  mean
+)
+```
+
+
+```{r}
+aggregate(
+  cbind(PC1, PC2) ~ sex,
+  data = pca_df,
+  mean
+)
+```
+
+
+```{r}
+aggregate(
+    cbind(PC1, PC2) ~ age,
+    data = pca_df,
+    mean
+)
+```
+
+PCA of  liver proteome reveal that age was the primary determinant of global protein abundance patterns. Mean PC1 scores differed by approximately 61 units between 8-week and 18-week fish, substantially exceeding the shifts associated with environment (~11 units) or sex (~9 units). Environment and sex also influenced proteome organization, particularly along PC2, but their effects were modest relative to the strong age-associated separation.
+
+
+
+
+
+```{r}
+## Visualize overall protein abundance per sample by environment and age.
+
+aprot_liver <- assay(data_imp) %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Protein") %>%
+  tidyr::pivot_longer(
+    cols = -Protein,
+    names_to = "SampleID",
+    values_to = "PG_abundance"
+  ) %>%
+  dplyr::left_join(
+    sample_meta %>%
+      dplyr::select(
+        SampleID = sample,
+        age,
+        environment,
+        sex
+      ),
+    by = "SampleID"
+  ) %>%
+  dplyr::mutate(
+    EnvAge = paste0(
+      ifelse(environment == "Lab", "L", "M"),
+      gsub("wk", "", age)
+    ),
+    EnvAge = factor(EnvAge, levels = c("L8", "M8", "L18", "M18")),
+    AgeStage = factor(
+      ifelse(age == "8wk", "Young", "Middle"),
+      levels = c("Young", "Middle")
+    ),
+    Envt = factor(
+      ifelse(environment == "Lab", "L", "M"),
+      levels = c("L", "M")
+    )
+  )
+
+ggplot(
+  aprot_liver,
+  aes(x = EnvAge, y = PG_abundance, color = Envt)
+) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  geom_jitter(width = 0.2, height = 0, alpha = 0.15, size = 0.4) +
+  facet_wrap(~ AgeStage, scales = "free_x", drop = TRUE) +
+  theme_bw() +
+  labs(
+    title = "Overall liver protein abundance",
+    x = "Environment and age",
+    y = "Protein-group abundance",
+    color = "Environment"
+  )
+```
+Global protein abundance distributions are broadly similar across age and environment groups after normalization and imputation, indicating successful preprocessing and comparable overall proteome coverage. While median abundance is modestly higher in 18-week laboratory fish, differences in overall abundance distributions are small relative to the strong age-associated separation observed in PCA. These results suggest that aging primarily alters the composition of the liver proteome rather than causing a uniform increase or decrease in total protein abundance.
+
+
+```{r}
+## Test whether overall protein abundance differs between 8-week and 18-week liver samples.
+
+subset_data <- aprot_liver %>%
+  dplyr::filter(AgeStage %in% c("Young", "Middle"))
+
+t_test_age <- t.test(
+  PG_abundance ~ AgeStage,
+  data = subset_data
+)
+
+t_test_age
+```
+
+
+```{r}
+## Pairwise tests of overall protein abundance among L8, L8, L18, and L18.
+
+pairwise.t.test(
+  aprot_liver$PG_abundance,
+  aprot_liver$EnvAge,
+  p.adjust.method = "BH"
+)
+```
+age signal is real and that environment effects may strengthen with age.
+
+```{r}
+## Volcano plot: M8 vs L8
+
+group1 <- rownames(sample_meta)[sample_meta$condition == "L_8FL"]
+group2 <- rownames(sample_meta)[sample_meta$condition == "L_8FM"]
+
+mat <- assay(data_imp)
+
+log2_fc <- rowMeans(mat[, group2]) - rowMeans(mat[, group1])
+
+p_values <- apply(
+  mat[, c(group1, group2)],
+  1,
+  function(x) {
+    g1 <- x[1:length(group1)]
+    g2 <- x[(length(group1) + 1):length(x)]
+    t.test(g1, g2)$p.value
+  }
+)
+
+v_data <- data.frame(
+  Protein = rownames(mat),
+  log2FC = log2_fc,
+  p_value = p_values
+)
+
+v_data$neg_log10P <- -log10(v_data$p_value)
+
+log2FC_thresh <- 1
+pval_thresh <- -log10(0.05)
+
+v_data$category <- with(
+  v_data,
+  ifelse(
+    abs(log2FC) > log2FC_thresh & neg_log10P > pval_thresh,
+    "Significant Both",
+    ifelse(
+      abs(log2FC) > log2FC_thresh,
+      "Significant Log2FC",
+      ifelse(
+        neg_log10P > pval_thresh,
+        "Significant P-value",
+        "Not Significant"
+      )
+    )
+  )
+)
+
+library(ggrepel)
+
+ggplot(
+  v_data,
+  aes(log2FC, neg_log10P, color = category)
+) +
+  geom_point(alpha = 0.6) +
+  geom_vline(
+    xintercept = c(-1, 1),
+    linetype = "dashed"
+  ) +
+  geom_hline(
+    yintercept = -log10(0.05),
+    linetype = "dashed"
+  ) +
+  geom_text_repel(
+    aes(
+      label = ifelse(
+        category == "Significant Both",
+        Protein,
+        ""
+      )
+    ),
+    max.overlaps = 15,
+    size = 3
+  ) +
+  scale_color_manual(
+    values = c(
+      "Not Significant" = "grey80",
+      "Significant P-value" = "black",
+      "Significant Log2FC" = "#009E73",
+      "Significant Both" = "orange"
+    )
+  ) +
+  labs(
+    title = "Mesocosm vs Lab (8 wk)",
+    x = "Log2 Fold Change",
+    y = "-log10(p-value)"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "none"
+  )
+```
+
+
+##improvements
+```{r}
+## Volcano plot: Mesocosm vs Lab at 8 weeks (female samples)
+## Uses gene names and BH-adjusted p-values.
+
+library(ggrepel)
+
+group_lab <- rownames(sample_meta)[sample_meta$condition == "L_8FL"]
+group_meso <- rownames(sample_meta)[sample_meta$condition == "L_8FM"]
+
+mat <- assay(data_imp)
+
+## Calculate log2 fold change.
+log2_fc <- rowMeans(mat[, group_meso]) -
+           rowMeans(mat[, group_lab])
+
+## Protein-wise t-tests.
+p_values <- apply(
+  mat[, c(group_lab, group_meso)],
+  1,
+  function(x) {
+    g1 <- x[1:length(group_lab)]
+    g2 <- x[(length(group_lab) + 1):length(x)]
+    t.test(g1, g2)$p.value
+  }
+)
+
+## FDR correction.
+padj <- p.adjust(p_values, method = "BH")
+
+## Get gene names from DEP2 object.
+gene_names <- rowData(data_imp)$name
+
+v_data <- data.frame(
+  Protein = rownames(mat),
+  Gene = gene_names,
+  log2FC = log2_fc,
+  p_value = p_values,
+  padj = padj
+)
+
+## Use protein ID if gene name missing.
+v_data$Gene[is.na(v_data$Gene) | v_data$Gene == ""] <-
+  v_data$Protein[is.na(v_data$Gene) | v_data$Gene == ""]
+
+v_data$neg_log10_FDR <- -log10(v_data$padj)
+
+## Thresholds.
+fc_cutoff <- 1
+fdr_cutoff <- 0.05
+
+v_data$category <- with(
+  v_data,
+  ifelse(
+    abs(log2FC) > fc_cutoff & padj < fdr_cutoff,
+    "FDR + FC",
+    ifelse(
+      padj < fdr_cutoff,
+      "FDR only",
+      ifelse(
+        abs(log2FC) > fc_cutoff,
+        "FC only",
+        "Not significant"
+      )
+    )
+  )
+)
+
+## Label strongest FDR+FC hits.
+label_df <- v_data %>%
+  dplyr::filter(category == "FDR + FC") %>%
+  dplyr::arrange(padj) %>%
+  dplyr::slice_head(n = 25)
+
+n_sig <- sum(v_data$category == "FDR + FC")
+
+ggplot(
+  v_data,
+  aes(log2FC, neg_log10_FDR, color = category)
+) +
+  geom_point(alpha = 0.6, size = 1.8) +
+  geom_vline(
+    xintercept = c(-fc_cutoff, fc_cutoff),
+    linetype = "dashed"
+  ) +
+  geom_hline(
+    yintercept = -log10(fdr_cutoff),
+    linetype = "dashed"
+  ) +
+  geom_text_repel(
+    data = label_df,
+    aes(label = Gene),
+    size = 3,
+    max.overlaps = 50
+  ) +
+  scale_color_manual(
+    values = c(
+      "Not significant" = "grey80",
+      "FC only" = "#1b9e77",
+      "FDR only" = "black",
+      "FDR + FC" = "#d95f02"
+    )
+  ) +
+  theme_bw() +
+  labs(
+    title = paste0(
+      "Mesocosm vs Lab (8 wk females)\n",
+      n_sig,
+      " proteins pass FDR < 0.05 and |log2FC| > 1"
+    ),
+    x = "Log2 fold change (Mesocosm / Lab)",
+    y = "-log10(FDR)"
+  )
+```
+
+
+
+
+```{r}
+## L18 vs L8 volcano using the DEP2-imputed liver dataset.
+
+library(ggrepel)
+
+group_M8 <- rownames(sample_meta)[sample_meta$condition == "L_8FM"]
+group_M18 <- rownames(sample_meta)[sample_meta$condition == "L_18FM"]
+
+mat <- assay(data_imp)
+
+## Compute log2 fold changes.
+log2_fc <- rowMeans(mat[, group_M18]) -
+           rowMeans(mat[, group_M8])
+
+## Protein-wise t-tests.
+p_values <- apply(
+  mat[, c(group_M8, group_M18)],
+  1,
+  function(x) {
+    g1 <- x[1:length(group_M8)]
+    g2 <- x[(length(group_M8) + 1):length(x)]
+    t.test(g1, g2)$p.value
+  }
+)
+
+## Gene names.
+gene_names <- rowData(data_imp)$name
+
+v_data <- data.frame(
+  Protein = rownames(mat),
+  Gene = gene_names,
+  log2FC = log2_fc,
+  p_value = p_values
+)
+
+v_data$Gene[is.na(v_data$Gene) | v_data$Gene == ""] <-
+  v_data$Protein[is.na(v_data$Gene) | v_data$Gene == ""]
+
+v_data$neg_log10P <- -log10(v_data$p_value)
+
+## Thresholds.
+log2FC_thresh <- 1
+pval_thresh <- -log10(0.05)
+
+v_data$category <- with(
+  v_data,
+  ifelse(
+    abs(log2FC) > log2FC_thresh &
+      neg_log10P > pval_thresh,
+    "Significant Both",
+    ifelse(
+      abs(log2FC) > log2FC_thresh,
+      "Significant Log2FC",
+      ifelse(
+        neg_log10P > pval_thresh,
+        "Significant P-value",
+        "Not Significant"
+      )
+    )
+  )
+)
+
+## Volcano plot.
+lm18 <- ggplot(
+  v_data,
+  aes(
+    x = log2FC,
+    y = neg_log10P,
+    color = category
+  )
+) +
+  geom_point(alpha = 0.6) +
+  geom_vline(
+    xintercept = c(-1, 1),
+    linetype = "dashed"
+  ) +
+  geom_hline(
+    yintercept = -log10(0.05),
+    linetype = "dashed"
+  ) +
+  geom_text_repel(
+    aes(
+      label = ifelse(
+        category == "Significant Both",
+        Gene,
+        ""
+      )
+    ),
+    box.padding = 0.5,
+    max.overlaps = 20,
+    size = 3
+  ) +
+  scale_color_manual(
+    values = c(
+      "Not Significant" = "gray85",
+      "Significant P-value" = "gray5",
+      "Significant Log2FC" = "#009E73",
+      "Significant Both" = "orange"
+    )
+  ) +
+  theme_bw() +
+  labs(
+    title = "Mesocosm 18 wk vs 8 wk",
+    x = "Log2 Fold Change",
+    y = "-log10(p-value)"
+  ) +
+  theme(
+    legend.position = "none"
+  )
+
+lm18
+```
+
+
+
+```{r}
+## Define a reusable function for volcano plots from the DEP2-imputed liver dataset.
+
+library(ggrepel)
+
+make_liver_volcano <- function(group1, group2, plot_title) {
+  
+  mat <- assay(data_imp)
+  
+  group1_samples <- rownames(sample_meta)[sample_meta$condition == group1]
+  group2_samples <- rownames(sample_meta)[sample_meta$condition == group2]
+  
+  log2_fc <- rowMeans(mat[, group2_samples]) -
+    rowMeans(mat[, group1_samples])
+  
+  p_values <- apply(
+    mat[, c(group1_samples, group2_samples)],
+    1,
+    function(x) {
+      g1 <- x[1:length(group1_samples)]
+      g2 <- x[(length(group1_samples) + 1):length(x)]
+      t.test(g1, g2)$p.value
+    }
+  )
+  
+  gene_names <- rowData(data_imp)$name
+  
+  v_data <- data.frame(
+    Protein = rownames(mat),
+    Gene = gene_names,
+    log2FC = log2_fc,
+    p_value = p_values
+  )
+  
+  v_data$Gene[is.na(v_data$Gene) | v_data$Gene == ""] <-
+    v_data$Protein[is.na(v_data$Gene) | v_data$Gene == ""]
+  
+  v_data$neg_log10P <- -log10(v_data$p_value)
+  
+  log2FC_thresh <- 1
+  pval_thresh <- -log10(0.05)
+  
+  v_data$category <- with(
+    v_data,
+    ifelse(
+      abs(log2FC) > log2FC_thresh & neg_log10P > pval_thresh,
+      "Significant Both",
+      ifelse(
+        abs(log2FC) > log2FC_thresh,
+        "Significant Log2FC",
+        ifelse(
+          neg_log10P > pval_thresh,
+          "Significant P-value",
+          "Not Significant"
+        )
+      )
+    )
+  )
+  
+  label_df <- v_data %>%
+    dplyr::filter(category == "Significant Both") %>%
+    dplyr::arrange(p_value) %>%
+    dplyr::slice_head(n = 20)
+  
+  p <- ggplot(
+    v_data,
+    aes(x = log2FC, y = neg_log10P, color = category)
+  ) +
+    geom_point(alpha = 0.6) +
+    geom_vline(
+      xintercept = c(-log2FC_thresh, log2FC_thresh),
+      linetype = "dashed"
+    ) +
+    geom_hline(
+      yintercept = pval_thresh,
+      linetype = "dashed"
+    ) +
+    geom_text_repel(
+      data = label_df,
+      aes(label = Gene),
+      box.padding = 0.5,
+      max.overlaps = 20,
+      size = 3
+    ) +
+    scale_color_manual(
+      values = c(
+        "Not Significant" = "gray85",
+        "Significant P-value" = "gray5",
+        "Significant Log2FC" = "#009E73",
+        "Significant Both" = "orange"
+      )
+    ) +
+    theme_bw() +
+    labs(
+      title = plot_title,
+      x = paste0("Log2 fold change (", group2, " / ", group1, ")"),
+      y = "-log10(p-value)"
+    ) +
+    theme(
+      legend.position = "none"
+    )
+  
+  return(
+    list(
+      plot = p,
+      data = v_data
+    )
+  )
+}
+```
+
+
+```{r}
+## Generate the four main liver volcano plots.
+
+volc_M8_vs_L8 <- make_liver_volcano(
+  group1 = "L_8FL",
+  group2 = "L_8FM",
+  plot_title = "Mesocosm vs Lab at 8 wk"
+)
+
+volc_M18_vs_L18 <- make_liver_volcano(
+  group1 = "L_18FL",
+  group2 = "L_18FM",
+  plot_title = "Mesocosm vs Lab at 18 wk"
+)
+
+volc_L18_vs_L8 <- make_liver_volcano(
+  group1 = "L_8FL",
+  group2 = "L_18FL",
+  plot_title = "Lab aging: 18 wk vs 8 wk"
+)
+
+volc_M18_vs_M8 <- make_liver_volcano(
+  group1 = "L_8FM",
+  group2 = "L_18FM",
+  plot_title = "Mesocosm aging: 18 wk vs 8 wk"
+)
+```
+
+
+
+
+
+```{r}
+## Display the Mesocosm aging volcano plot.
+
+volc_M18_vs_M8$plot
+```
+
+
+```{r}
+## Arrange the four volcano plots into a 2 x 2 panel.
+
+library(ggpubr)
+
+volcano_panel <- ggarrange(
+  volc_M8_vs_L8$plot,
+  volc_M18_vs_L18$plot,
+  volc_L18_vs_L8$plot,
+  volc_M18_vs_M8$plot,
+  nrow = 2,
+  ncol = 2,
+  labels = c("A", "B", "C", "D")
+)
+
+volcano_panel
+```
+Liver aging appears to be the dominant proteomic process in this dataset, producing substantially larger proteomic shifts than environmental differences, whereas environmental effects are already detectable at 8 weeks and persist, albeit more weakly, at 18 weeks.
+
+
+```{r}
+nrow(
+  subset(
+    volc_M8_vs_L8$data,
+    abs(log2FC) > 1 & p_value < 0.05
+  )
+)
+
+nrow(
+  subset(
+    volc_M18_vs_L18$data,
+    abs(log2FC) > 1 & p_value < 0.05
+  )
+)
+
+nrow(
+  subset(
+    volc_L18_vs_L8$data,
+    abs(log2FC) > 1 & p_value < 0.05
+  )
+)
+
+nrow(
+  subset(
+    volc_M18_vs_M8$data,
+    abs(log2FC) > 1 & p_value < 0.05
+  )
+)
+```
+
+
+```{r}
+## Build liver limma model fresh.
+
+library(limma)
+
+sample_meta <- as.data.frame(colData(data_imp))
+
+sample_meta$condition <- factor(sample_meta$condition)
+
+design <- model.matrix(
+  ~ 0 + condition,
+  data = sample_meta
+)
+
+colnames(design) <- levels(sample_meta$condition)
+
+cat("Design dimensions:\n")
+print(dim(design))
+
+cat("Design columns:\n")
+print(colnames(design))
+
+fit <- limma::lmFit(
+  assay(data_imp),
+  design
+)
+
+
+cont.matrix
+cont.matrix <- limma::makeContrasts(
+  M8_vs_L8   = L_8FM  - L_8FL,
+  M18_vs_L18 = L_18FM - L_18FL,
+  L18_vs_L8  = L_18FL - L_8FL,
+  M18_vs_M8  = L_18FM - L_8FM,
+  Age_by_Environment =
+    (L_18FM - L_8FM) -
+    (L_18FL - L_8FL),
+  levels = design
+)
+
+fit2 <- limma::contrasts.fit(fit, cont.matrix)
+fit2 <- limma::eBayes(fit2)
+
+cat("Fit2 dimensions:\n")
+print(dim(fit2$coefficients))
+
+summary(decideTests(fit2))
+```
+
+Age is a dominant determinant of liver proteome composition, with 2,071 proteins differing between 18-week and 8-week laboratory fish and 1,029 proteins differing between 18-week and 8-week mesocosm fish. Environmental effects are negligible with only two proteins differing between mesocosm and laboratory fish at 8 weeks and no significant proteins detected at 18 weeks. No proteins exhibited a significant age-by-environment interaction, indicating that aging-associated proteomic remodeling occurred largely independently of environmental condition.
+
+
+```{r}
+## Top proteins changing with Mesocosm aging.
+
+top_M18_vs_M8 <- topTable(
+  fit2,
+  coef = "M18_vs_M8",
+  number = 20,
+  sort.by = "P"
+)
+
+top_M18_vs_M8
+```
+
+
+
+```{r}
+## Examine significant proteins.
+
+sig_M18_vs_M8 <- topTable(
+  fit2,
+   coef = "M18_vs_M8",
+   number = Inf,
+    p.value = 0.05)
+
+nrow(sig_M18_vs_M8) 
+```
+
+
+```{r}
+lab_sig <- rownames(
+  topTable(
+    fit2,
+    coef = "L18_vs_L8",
+    number = Inf,
+    p.value = 0.05
+  )
+)
+
+meso_sig <- rownames(
+  topTable(
+    fit2,
+    coef = "M18_vs_M8",
+    number = Inf,
+    p.value = 0.05
+  )
+)
+
+shared_sig <- intersect(lab_sig, meso_sig)
+
+length(shared_sig)
+```
+
+
+
+```{r}
+lab_only <- setdiff(lab_sig, meso_sig)
+
+meso_only <- setdiff(meso_sig, lab_sig)
+
+length(lab_only)
+length(meso_only)
+```
+
+
+```{r}
+ shared_sig <- intersect(lab_sig, meso_sig)
+
+lab_only <- setdiff(lab_sig, meso_sig)
+
+meso_only <- setdiff(meso_sig, lab_sig)
+```
+
+
+
+```{r}
+shared_clean <- unique(clean_gene_symbol(shared_sig))
+lab_only_clean <- unique(clean_gene_symbol(lab_only))
+meso_only_clean <- unique(clean_gene_symbol(meso_only))
+```
+
+
+```{r}
+length(shared_sig)
+length(shared_clean)
+
+length(lab_only)
+length(lab_only_clean)
+
+length(meso_only)
+length(meso_only_clean)
+
+head(shared_clean, 20)
+```
+
+
+```{r}
+shared_map <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = shared_clean,
+  keytype = "SYMBOL",
+  columns = c("SYMBOL", "ENTREZID")
+)
+```
+
+
+```{r}
+shared_map_clean <- shared_map %>%
+  dplyr::filter(!is.na(ENTREZID)) %>%
+  dplyr::distinct(SYMBOL, ENTREZID)
+
+cat("Shared cleaned genes:", length(shared_clean), "\n")
+cat("Mapped genes:", nrow(shared_map_clean), "\n")
+cat(
+  "Mapping percentage:",
+  round(100 * nrow(shared_map_clean) / length(shared_clean), 1),
+  "%\n"
+)
+
+head(shared_map_clean)
+```
+
+##mapping rate
+```{r}
+cat("Shared cleaned genes:", length(shared_clean), "\n")
+cat("Mapped genes:", nrow(shared_map_clean), "\n")
+cat(
+  "Mapping percentage:",
+  round(100 * nrow(shared_map_clean) / length(shared_clean), 1),
+  "%\n"
+)
+```
+
+
+```{r}
+ego_shared <- enrichGO(
+  gene          = shared_map_clean$ENTREZID,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+```
+
+
+```{r}
+nrow(as.data.frame(ego_shared))
+head(
+  as.data.frame(ego_shared)[,
+    c("Description", "GeneRatio", "p.adjust", "Count")
+  ],
+  20
+)
+```
+Of the proteins exhibiting age-associated abundance changes, 855 were shared between laboratory and mesocosm environments. Functional enrichment analysis of these shared proteins reveal overrepresentation of small-molecule catabolism, amino acid metabolism, fatty acid oxidation, cellular respiration, and cytoplasmic translation. 
+
+##visualize
+
+```{r}
+dotplot(
+  ego_shared,
+  showCategory = 20,
+  font.size = 12
+)
+```
+
+
+```{r}
+ego_shared_simp <- simplify(
+  ego_shared,
+  cutoff = 0.7,
+  by = "p.adjust",
+  select_fun = min
+)
+
+dotplot(
+  ego_shared_simp,
+  showCategory = 20,
+  font.size = 12
+)
+```
+
+To identify biological processes associated with liver aging independent of environmental conditions, I examined the 855 proteins that exhibited significant age-associated changes in both laboratory and mesocosm fish. After collapsing protein identifiers and mapping to human orthologs, 417 genes (64.3%) were successfully annotated and used for Gene Ontology (GO) enrichment analysis. Shared aging proteins were strongly enriched for metabolic processes, including small molecule catabolism (FDR = 2.1 × 10⁻²⁴), organic acid catabolism (FDR = 1.0 × 10⁻²²), amino acid metabolism (FDR = 1.4 × 10⁻¹³), and fatty acid oxidation (FDR = 1.3 × 10⁻¹¹). Pathways associated with energy production and mitochondrial function, including generation of precursor metabolites and energy, aerobic respiration, cellular respiration, and energy derivation by oxidation of organic compounds, were also significantly enriched, indicating extensive remodeling of hepatic energy metabolism with age. In addition, cytoplasmic translation was strongly enriched, suggesting age-related alterations in protein synthesis and proteome maintenance. Collectively, these findings indicate that liver aging is characterized by coordinated metabolic, bioenergetic, and translational remodeling that is largely conserved across environmental conditions.
+
+
+```{r}
+## Extract the top 50 significant proteins from Mesocosm aging.
+
+top50_ids <- rownames(
+  topTable(
+    fit2,
+    coef = "M18_vs_M8",
+    number = 50,
+    sort.by = "P"
+  )
+)
+
+length(top50_ids)
+
+head(top50_ids)
+```
+
+```{r}
+## Heatmap of the top 50 shared liver aging proteins.
+## These proteins are significantly altered with age in both Lab and Mesocosm fish.
+
+library(pheatmap)
+
+shared_top50 <- shared_sig[
+  order(
+    abs(fit2$coefficients[shared_sig, "L18_vs_L8"]),
+    decreasing = TRUE
+  )
+][1:50]
+
+heat_mat <- assay(data_imp)[shared_top50, ]
+
+heat_mat_z <- t(
+  scale(
+    t(heat_mat)
+  )
+)
+
+annotation_col <- as.data.frame(colData(data_imp))[
+  , "age",
+  drop = FALSE
+]
+
+pheatmap(
+  heat_mat_z,
+  annotation_col = annotation_col,
+  show_rownames = FALSE,
+  fontsize_col = 10,
+  clustering_method = "complete",
+  main = "Shared liver aging proteins (top 50)"
+)
+```
+
+
+
+
+
+
+
+```{r}
+## Heatmap of the top 50 Mesocosm-aging proteins.
+
+library(pheatmap)
+
+meso_samples <- rownames(sample_meta)[
+  sample_meta$condition %in% c("L_8FM", "L_18FM")
+]
+
+heat_mat <- assay(data_imp)[top50_ids, meso_samples]
+
+## Z-score by protein.
+heat_mat_z <- t(scale(t(heat_mat)))
+
+annotation_col <- data.frame(
+  Age = sample_meta[meso_samples, "age"],
+  row.names = meso_samples
+)
+
+pheatmap(
+  heat_mat_z,
+  annotation_col = annotation_col,
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  clustering_method = "complete",
+  fontsize_row = 6,
+  main = "Top 50 proteins: Mesocosm aging (18 wk vs 8 wk)"
+)
+```
+
+Hierarchical clustering of the top 50 proteins differentially abundant between 8- and 18-week Mesocosm females reveal separation of age groups. Older fish exhibit increased abundance of structural and contractile proteins, including collagens and myofibrillar proteins, whereas numerous ribosomal and ribosome-biogenesis-associated proteins are reduced.
+
+#heatmap all 
+```{r}
+## Heatmap of all significant proteins from Mesocosm aging.
+
+library(pheatmap)
+
+sig_ids <- rownames(sig_M18_vs_M8)
+
+meso_samples <- rownames(sample_meta)[
+  sample_meta$condition %in% c("L_8FM", "L_18FM")
+]
+
+heat_mat <- assay(data_imp)[sig_ids, meso_samples]
+
+## Z-score by protein.
+heat_mat_z <- t(scale(t(heat_mat)))
+
+annotation_col <- data.frame(
+  Age = sample_meta[meso_samples, "age"],
+  row.names = meso_samples
+)
+
+pheatmap(
+  heat_mat_z,
+  annotation_col = annotation_col,
+  show_rownames = FALSE,
+  show_colnames = TRUE,
+  clustering_method = "complete",
+  fontsize_col = 10,
+  main = paste0(
+    "Mesocosm aging signature (",
+    length(sig_ids),
+    " proteins)"
+  )
+)
+```
+
+
+
+## Split heatmaps for proteins increased and decreased with Mesocosm aging.
+```{r}
+
+
+library(pheatmap)
+
+meso_samples <- rownames(sample_meta)[
+  sample_meta$condition %in% c("L_8FM", "L_18FM")
+]
+
+annotation_col <- data.frame(
+  Age = sample_meta[meso_samples, "age"],
+  row.names = meso_samples
+)
+
+## Up with age
+up_ids <- rownames(up_M18_vs_M8)
+
+heat_up <- assay(data_imp)[up_ids, meso_samples]
+heat_up_z <- t(scale(t(heat_up)))
+
+pheatmap(
+  heat_up_z,
+  annotation_col = annotation_col,
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  clustering_method = "complete",
+  fontsize_row = 7,
+  main = paste0(
+    "Proteins increased with Mesocosm aging (",
+    length(up_ids),
+    " proteins)"
+  )
+)
+
+## Down with age
+down_ids <- rownames(down_M18_vs_M8)
+
+heat_down <- assay(data_imp)[down_ids, meso_samples]
+heat_down_z <- t(scale(t(heat_down)))
+
+pheatmap(
+  heat_down_z,
+  annotation_col = annotation_col,
+  show_rownames = FALSE,
+  show_colnames = TRUE,
+  clustering_method = "complete",
+  fontsize_col = 10,
+  main = paste0(
+    "Proteins decreased with Mesocosm aging (",
+    length(down_ids),
+    " proteins)"
+  )
+)
+```
+
+
+##important question still to ask (M18−M8)−(L18−L8): Which proteins change with age in Mesocosm but not in Lab?/Which proteins age differently between environments?
+## so frar results hint that there is little age-related proteomic remodeling in lab and there are strong age-related remodeling in meso
+#add contrasts
+```{r}
+cont.matrix <- makeContrasts(
+  M8_vs_L8   = L_8FM  - L_8FL,
+  M18_vs_L18 = L_18FM - L_18FL,
+  L18_vs_L8  = L_18FL - L_8FL,
+  M18_vs_M8  = L_18FM - L_8FM,
+
+  Age_by_Environment =
+    (L_18FM - L_8FM) -
+    (L_18FL - L_8FL), levels = design
+)
+```
+
+#Refit
+```{r}
+up_M18_vs_M8 <- sig_M18_vs_M8[
+  sig_M18_vs_M8$logFC > 0,
+]
+
+down_M18_vs_M8 <- sig_M18_vs_M8[
+  sig_M18_vs_M8$logFC < 0,
+]
+
+nrow(up_M18_vs_M8)
+nrow(down_M18_vs_M8)
+
+fit2 <- contrasts.fit(fit, cont.matrix)
+fit2 <- eBayes(fit2)
+
+summary(decideTests(fit2))
+```
+        
+
+
+```{r}
+top_interaction <- topTable(
+  fit2,
+  coef = "Age_by_Environment",
+  number = 20
+)
+
+top_interaction[, c("logFC", "P.Value", "adj.P.Val")]
+```
+
+#visualise the genes that show near-significant interaction effects
+
+
+```{r}
+## Visualize top liver interaction-candidate proteins.
+## Note: these are not FDR-significant; they are exploratory candidates only.
+genes_to_plot <- rownames(top_interaction)[1:6]
+
+sample_meta_plot <- as.data.frame(colData(data_imp)) %>%
+  tibble::rownames_to_column("sample_id")
+
+plot_multi_df <- assay(data_imp)[genes_to_plot, , drop = FALSE] %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Protein") %>%
+  tidyr::pivot_longer(
+    cols = -Protein,
+    names_to = "sample_id",
+    values_to = "abundance"
+  ) %>%
+  dplyr::left_join(
+    sample_meta_plot %>%
+      dplyr::select(sample_id, group_name, age, environment, sex),
+    by = "sample_id"
+  ) %>%
+  dplyr::filter(
+    sex == "Female",
+    group_name %in% c("L_8FL", "L_18FL", "L_8FM", "L_18FM")
+  ) %>%
+  dplyr::mutate(
+    age = factor(age, levels = c("8wk", "18wk")),
+    environment = factor(environment, levels = c("Lab", "Mesocosm"))
+  )
+
+dim(plot_multi_df)
+
+ggplot(
+  plot_multi_df,
+  aes(x = age, y = abundance, fill = environment)
+) +
+  geom_boxplot(
+    outlier.shape = NA,
+    alpha = 0.6,
+    position = position_dodge(width = 0.75)
+  ) +
+  geom_jitter(
+    aes(color = environment),
+    position = position_jitterdodge(
+      jitter.width = 0.12,
+      dodge.width = 0.75
+    ),
+    size = 1.8,
+    alpha = 0.85
+  ) +
+  facet_wrap(~ Protein, scales = "free_y", ncol = 3) +
+  theme_bw() +
+  labs(
+    title = "Exploratory liver age-by-environment candidates",
+    x = "Age",
+    y = "Normalized/imputed abundance",
+    fill = "Environment",
+    color = "Environment"
+  ) +
+  theme(
+    legend.position = "bottom"
+  )
+
+  
+```
+Although no proteins exhibited significant age-by-environment interactions after multiple-testing correction, several proteins showed suggestive interaction-like abundance patterns. Examples included SHMT1, TAGLN, TIMP2A, and PCYT2, where the direction or magnitude of age-associated changes differed between laboratory and mesocosm fish. However, these effects did not remain significant after correction for multiple comparisons, indicating that environment-dependent aging responses were limited relative to the strong shared aging signature observed across conditions.
+
+
+
+##plot those with strongest interaction
+
+```{r}
+genes_to_plot <- rownames(top_interaction)[1:6]
+
+sample_meta_plot <- as.data.frame(colData(data_imp)) %>%
+  tibble::rownames_to_column("sample_id")
+
+plot_df <- assay(data_imp)[genes_to_plot, , drop = FALSE] %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Protein") %>%
+  tidyr::pivot_longer(
+    cols = -Protein,
+    names_to = "sample_id",
+    values_to = "abundance"
+  ) %>%
+  dplyr::left_join(
+    sample_meta_plot %>%
+      dplyr::select(sample_id, group_name, age, environment, sex),
+    by = "sample_id"
+  ) %>%
+  dplyr::filter(
+    sex == "Female",
+    group_name %in% c("L_8FL", "L_18FL", "L_8FM", "L_18FM")
+  ) %>%
+  dplyr::mutate(
+    age = factor(age, levels = c("8wk", "18wk")),
+    environment = factor(environment, levels = c("Lab", "Mesocosm"))
+  )
+
+ggplot(
+  plot_df,
+  aes(
+    x = age,
+    y = abundance,
+    fill = environment
+  )) +
+  geom_boxplot(
+    outlier.shape = NA,
+    alpha = 0.6,
+    position = position_dodge(width = 0.75)
+  ) +
+  geom_jitter(
+    aes(color = environment),
+    position = position_jitterdodge(
+      jitter.width = 0.08,
+      dodge.width = 0.75
+    ),
+    size = 2,
+    alpha = 0.85
+  ) +
+  facet_wrap(
+    ~ Protein,
+    scales = "free_y",
+    ncol = 2
+  ) +
+  theme_bw(base_size = 14) +
+  labs(
+    title = "Top candidate age-by-environment proteins",
+    x = "Age",
+    y = "Normalized/imputed abundance",
+    fill = "Environment",
+    color = "Environment"
+  ) +
+  theme(
+    legend.position = "bottom",
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(face = "bold")
+  )
+```
+Top-ranked candidate proteins from the age-by-environment interaction contrast in female liver. Although no proteins exhibited significant interaction effects after multiple-testing correction, several proteins display environment-dependent aging trajectories. SHMT1.2, TAGLN, and TIMP2A show qualitative interaction patterns, with age-associated abundance changes differing in magnitude or direction between laboratory and mesocosm fish. These proteins are presented as exploratory candidates and do not represent statistically significant interaction effects after false-discovery-rate correction.
+
+##decide again!
+```{r}
+summary(decideTests(fit2))
+```
+summary(decideTests(fit2))
+       M8_vs_L8 M18_vs_L18 L18_vs_L8 M18_vs_M8 Age_by_Environment
+Down          2          0       868       664                  0
+NotSig     4988       4990      2919      3961               4990
+Up            0          0      1203       365                  0
+
+
+
+
+###look @ others
+```{r}
+sum(top_interaction$adj.P.Val < 0.05)
+sum(top_interaction$adj.P.Val < 0.10)
+sum(top_interaction$adj.P.Val < 0.15)
+sum(top_interaction$adj.P.Val < 0.20)
+```
+???
+sum(top_interaction$adj.P.Val < 0.05)
+[1] 0
+> sum(top_interaction$adj.P.Val < 0.10)
+[1] 0
+> sum(top_interaction$adj.P.Val < 0.15)
+[1] 0
+> sum(top_interaction$adj.P.Val < 0.20)
+[1] 0
+
+
+
+## Extract interaction candidate genes.
+```{r}
+
+interaction_genes <- unique(
+  rowData(data_imp)[rownames(interaction20), "name"]
+)
+
+interaction_genes <- interaction_genes[
+  !is.na(interaction_genes) &
+  interaction_genes != ""
+]
+
+sort(interaction_genes)
+length(interaction_genes)
+```
+
+
+```{r}
+clean_gene_symbol <- function(x) {
+  x <- toupper(x)
+  x <- sub("\\.[0-9]+$", "", x)
+  x
+}
+
+interaction_genes_clean <- unique(
+  clean_gene_symbol(interaction_genes)
+)
+
+length(interaction_genes_clean)
+
+interaction_genes_clean
+```
+
+#map the interaction prtn
+
+```{r}
+
+interaction_map <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = interaction_genes_clean,
+  keytype = "SYMBOL",
+  columns = c("SYMBOL", "ENTREZID")
+)
+
+interaction_map <- interaction_map %>%
+  dplyr::filter(!is.na(ENTREZID)) %>%
+  dplyr::distinct(SYMBOL, ENTREZID)
+
+cat(
+  "Mapped:",
+  nrow(interaction_map),
+  "of",
+  length(interaction_genes_clean),
+  "genes\n"
+)
+
+interaction_map
+
+```
+
+
+```{r}
+nrow(interaction_map)
+head(interaction_map)
+```
+
+
+
+#save files
+```{r}
+## Significant proteins increased with age.
+
+up_M18_vs_M8 <- sig_M18_vs_M8 %>%
+  dplyr::filter(logFC > 0)
+
+## Significant proteins decreased with age.
+
+down_M18_vs_M8 <- sig_M18_vs_M8 %>%
+  dplyr::filter(logFC < 0)
+
+cat("Up with age:", nrow(up_M18_vs_M8), "\n")
+cat("Down with age:", nrow(down_M18_vs_M8), "\n")
+
+head(rownames(up_M18_vs_M8))
+head(rownames(down_M18_vs_M8))
+```
+
+#genes with recognizable symbols
+```{r}
+sum(
+  !grepl(
+    "^Nfu_g_|^LOC|^G4P62_|^A0A",
+    rownames(sig_M18_vs_M8)
+  )
+)
+```
+
+###use actual gene names stored in dep2 rather than rownames 
+
+```{r}
+
+## Get gene annotations for significant proteins.
+
+sig_genes <- rowData(data_imp)[rownames(sig_M18_vs_M8), "name"]
+
+head(sig_genes)
+
+```
+
+#up_M18_vs_M8
+```{r}
+## Up-regulated genes.
+
+up_genes <- unique(
+  rowData(data_imp)[rownames(up_M18_vs_M8), "name"]
+)
+
+up_genes <- up_genes[
+  !is.na(up_genes) &
+  up_genes != ""
+]
+
+length(up_genes)
+
+## Down-regulated genes.
+
+down_genes <- unique(
+  rowData(data_imp)[rownames(down_M18_vs_M8), "name"]
+)
+
+down_genes <- down_genes[
+  !is.na(down_genes) &
+  down_genes != ""
+]
+
+length(down_genes)
+```
+
+
+#many unique gene symbols in each direction
+
+```{r}
+## Up-regulated genes.
+
+up_genes <- unique(
+  rowData(data_imp)[rownames(up_M18_vs_M8), "name"]
+)
+
+up_genes <- up_genes[
+  !is.na(up_genes) &
+  up_genes != ""
+]
+
+length(up_genes)
+
+## Down-regulated genes.
+
+down_genes <- unique(
+  rowData(data_imp)[rownames(down_M18_vs_M8), "name"]
+)
+
+down_genes <- down_genes[
+  !is.na(down_genes) &
+  down_genes != ""
+]
+
+length(down_genes)
+```
+
+
+```{r}
+
+sort(up_genes)
+sort(down_genes)
+head(sort(up_genes), 100)
+head(sort(down_genes), 100)
+
+```
+
+
+```{r}
+head(down_M18_vs_M8[, c("logFC", "adj.P.Val")], 50)
+
+head(up_M18_vs_M8[, c("logFC", "adj.P.Val")], 50)
+```
+
+
+```{r}
+head(
+  down_M18_vs_M8[, c("logFC", "adj.P.Val")],
+  50
+)
+
+```
+
+
+```{r}
+lab_clean <- unique(clean_gene_symbol(lab_only))
+
+lab_map <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = lab_clean,
+  keytype = "SYMBOL",
+  columns = c("SYMBOL", "ENTREZID")
+)
+
+lab_map_clean <- lab_map %>%
+  dplyr::filter(!is.na(ENTREZID)) %>%
+  dplyr::distinct(ENTREZID, .keep_all = TRUE)
+
+cat("Lab-only genes:", length(lab_clean), "\n")
+cat("Mapped genes:", nrow(lab_map_clean), "\n")
+```
+
+
+```{r}
+ego_lab <- enrichGO(
+  gene          = lab_map_clean$ENTREZID,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+nrow(as.data.frame(ego_lab))
+```
+
+
+#meso only
+```{r}
+meso_clean <- unique(clean_gene_symbol(meso_only))
+
+meso_map <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = meso_clean,
+  keytype = "SYMBOL",
+  columns = c("SYMBOL", "ENTREZID")
+)
+
+meso_map_clean <- meso_map %>%
+  dplyr::filter(!is.na(ENTREZID)) %>%
+  dplyr::distinct(ENTREZID, .keep_all = TRUE)
+
+cat("Meso-only genes:", length(meso_clean), "\n")
+cat("Mapped genes:", nrow(meso_map_clean), "\n")
+```
+
+
+```{r}
+ego_meso <- enrichGO(
+  gene          = meso_map_clean$ENTREZID,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+nrow(as.data.frame(ego_meso))
+```
+
+
+```{r}
+head(
+  as.data.frame(ego_lab)[,
+    c("Description","GeneRatio","p.adjust","Count")
+  ],
+  20
+)
+
+head(
+  as.data.frame(ego_meso)[,
+    c("Description","GeneRatio","p.adjust","Count")
+  ],
+  20
+)
+```
+
+
+```{r}
+## Visualize mapping success for shared, Lab-only, and Mesocosm-only aging sets.
+
+mapping_df <- data.frame(
+  Set = c("Shared aging", "Lab-only aging", "Mesocosm-only aging"),
+  Cleaned_genes = c(
+    length(shared_clean),
+    length(lab_clean),
+    length(meso_clean)
+  ),
+  Mapped_genes = c(
+    nrow(shared_map_clean),
+    nrow(lab_map_clean),
+    nrow(meso_map_clean)
+  )
+) %>%
+  dplyr::mutate(
+    Mapping_percent = round(100 * Mapped_genes / Cleaned_genes, 1)
+  )
+
+mapping_long <- mapping_df %>%
+  tidyr::pivot_longer(
+    cols = c(Cleaned_genes, Mapped_genes),
+    names_to = "Category",
+    values_to = "Gene_count"
+  )
+
+ggplot(
+  mapping_long,
+  aes(x = Set, y = Gene_count, fill = Category)
+) +
+  geom_col(
+    position = position_dodge(width = 0.75),
+    width = 0.65
+  ) +
+  geom_text(
+    data = mapping_df,
+    aes(
+      x = Set,
+      y = Mapped_genes,
+      label = paste0(Mapping_percent, "%")
+    ),
+    inherit.aes = FALSE,
+    vjust = -0.5,
+    size = 4
+  ) +
+  theme_bw(base_size = 14) +
+  labs(
+    title = "Human ortholog mapping success for liver aging gene sets",
+    x = NULL,
+    y = "Number of genes",
+    fill = NULL
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 20, hjust = 1),
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold")
+  )
+
+mapping_df
+```
+
+#shared dot plot
+```{r}
+dotplot(
+  ego_shared,
+  showCategory = 15,
+  font.size = 12
+) +
+  ggtitle("Shared liver aging")
+```
+
+#lab dot plot
+```{r}
+dotplot(
+  ego_lab,
+  showCategory = 15,
+  font.size = 12
+) +
+  ggtitle("Lab-specific liver aging")
+```
+ 
+ 
+#compare enrichments directly
+```{r}
+gene_list <- list(
+  Shared = shared_map_clean$ENTREZID,
+  Lab_only = lab_map_clean$ENTREZID,
+  Meso_only = meso_map_clean$ENTREZID
+)
+
+cc <- compareCluster(
+  geneCluster = gene_list,
+  fun = "enrichGO",
+  OrgDb = org.Hs.eg.db,
+  ont = "BP"
+)
+
+dotplot(cc, showCategory = 15)
+```
+
+
+```{r}
+library(VennDiagram)
+
+venn.plot <- venn.diagram(
+  x = list(
+    Lab = lab_sig,
+    Mesocosm = meso_sig
+  ),
+  filename = NULL,
+  fill = c("tomato", "steelblue"),
+  alpha = 0.5,
+  cex = 1.5,
+  cat.cex = 1.4
+)
+
+grid::grid.newpage()
+grid::grid.draw(venn.plot)
+```
+
+
+
+```{r}
+## all three dot plots
+
+dotplot(ego_shared, showCategory = 15, font.size = 12)
+dotplot(ego_lab, showCategory = 15, font.size = 12)
+dotplot(ego_meso, showCategory = 15, font.size = 12)
+
+library(enrichplot)
+
+dotplot(
+  lab_sig,
+  showCategory = 15,
+  font.size = 12
+)
+```
+
+
+
+```{r}
+
+library(enrichplot)
+
+ego_shared_sim <- pairwise_termsim(ego_shared)
+
+emapplot(
+  ego_shared_sim,
+  showCategory = 15
+)
+
+ego_lab_sim <- pairwise_termsim(ego_lab)
+
+emapplot(
+  ego_lab_sim,
+  showCategory = 15
+)
+
+```
+
+
+
+
+
+```{r}
+write.csv(sig_M18_vs_M8,
+          "Mesocosm_Aging_181_Proteins.csv")
+
+write.csv(as.data.frame(ego_down),
+          "Mesocosm_Aging_GO_Down.csv")
+
+write.csv(as.data.frame(ego_up),
+          "Mesocosm_Aging_GO_Up.csv")
+```
+
+
+

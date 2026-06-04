@@ -1,0 +1,2972 @@
+---
+title: "Muscle proteomics analysis using DEP2"
+author: "Ellen Mazalale"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+## Load packages and define analysis-wide settings.
+```{r setup, message=FALSE, warning=FALSE}
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(SummarizedExperiment)
+  library(DEP2)
+  library(limma)
+  library(vsn)
+  library(ggplot2)
+  library(pheatmap)
+  library(grid)
+})
+
+pg_file <- "merged_pg_matrix.tsv"
+meta_file <- "merged_sample_metadata.csv"
+
+OUT_DIR <- "muscle_DEP2_outputs"
+dir.create(OUT_DIR, showWarnings = FALSE)
+
+MIN_DETECT_FRAC <- 0.50
+FDR_CUTOFF <- 0.05
+
+set.seed(1)
+```
+
+# Analysis objective
+
+This analysis subsets the merged proteomics data to muscle samples only and uses DEP2 for protein identifier handling, SummarizedExperiment construction, missing-value filtering, VSN normalization, imputation, and quality control. The downstream modeling is performed on the DEP2-processed abundance matrix using limma so that age, environment, sex, and the age-by-environment interaction can be evaluated directly. The main biological goal is to determine whether muscle aging from 8 to 18 weeks is detectable in laboratory and mesocosm environments, whether the direction or magnitude of aging differs between environments, and whether any dominant biological pattern, such as ribosomal remodeling, emerges from the age-associated proteins.
+
+# Load raw matrix and metadata
+
+```{r load-data}
+## Load the merged protein-group matrix and sample metadata.
+
+mat_raw <- readr::read_tsv(pg_file, show_col_types = FALSE)
+meta_raw <- readr::read_csv(meta_file, show_col_types = FALSE)
+
+cat("Raw protein matrix dimensions:", dim(mat_raw), "\n")
+cat("Raw metadata dimensions:", dim(meta_raw), "\n")
+
+head(meta_raw)
+```
+
+#Subset to muscle samples
+
+```{r subset-muscle}
+
+## Restrict metadata to muscle samples from the 8-week and 18-week time points.
+
+meta_muscle <- meta_raw %>%
+  dplyr::filter(tissue == "Muscle") %>%
+  dplyr::filter(age %in% c("8wk", "18wk")) %>%
+  dplyr::mutate(
+    age = factor(age, levels = c("8wk", "18wk")),
+    environment = factor(environment, levels = c("Lab", "Mesocosm")),
+    sex = factor(sex, levels = c("Female", "Male"))
+  )
+
+cat("Muscle samples retained:", nrow(meta_muscle), "\n")
+
+table(meta_muscle$age, meta_muscle$environment, meta_muscle$sex)
+```
+
+## Confirm that every muscle sample column listed in metadata is present in the protein matrix.
+```{r}
+
+missing_sample_cols <- setdiff(meta_muscle$sample_column, colnames(mat_raw))
+
+cat("Missing sample columns:", length(missing_sample_cols), "\n")
+
+if (length(missing_sample_cols) > 0) {
+  print(missing_sample_cols)
+}
+```
+
+## Create the experimental design table for DEP2 using muscle metadata.
+```{r}
+
+
+exp_design_muscle <- meta_muscle %>%
+  dplyr::arrange(group_name, sample) %>%
+  dplyr::group_by(group_name) %>%
+  dplyr::mutate(
+    condition = as.character(group_name),
+    replicate = dplyr::row_number()
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(
+    label = sample_column,
+    condition,
+    replicate,
+    tissue,
+    age,
+    environment,
+    sex,
+    sample,
+    group_name
+  )
+
+print(exp_design_muscle, n = Inf)
+```
+
+## Create the muscle-specific protein matrix.
+```{r}
+
+sample_cols_muscle <- exp_design_muscle$label
+
+mat_muscle <- mat_raw %>%
+  dplyr::select(
+    Protein.Group,
+    Protein.Names,
+    Genes,
+    First.Protein.Description,
+    N.Sequences,
+    N.Proteotypic.Sequences,
+    dplyr::all_of(sample_cols_muscle)
+  )
+
+cat("Muscle matrix dimensions:", dim(mat_muscle), "\n")
+
+cat(
+  "Sample columns match experimental design:",
+  setequal(
+    sample_cols_muscle,
+    colnames(mat_muscle)[-(1:6)]
+  ),
+  "\n"
+)
+```
+
+## Remove protein groups with no quantified values in any muscle sample
+```{r}
+
+keep_muscle_proteins <- rowSums(
+  !is.na(mat_muscle[, sample_cols_muscle])
+) > 0
+
+cat("Proteins before removing all-missing muscle rows:", nrow(mat_muscle), "\n")
+cat("Proteins detected in at least one muscle sample:", sum(keep_muscle_proteins), "\n")
+cat("Proteins absent from all muscle samples:", sum(!keep_muscle_proteins), "\n")
+
+mat_muscle <- mat_muscle[keep_muscle_proteins, ]
+
+cat("Muscle matrix after removing all-missing rows:", dim(mat_muscle), "\n")
+```
+
+## Prepare protein identifiers for DEP2 by creating clean gene names and unique protein IDs.
+```{r}
+
+mat_dep <- mat_muscle %>%
+  dplyr::mutate(
+    Genes_clean = ifelse(
+      is.na(Genes) | Genes == "",
+      Protein.Group,
+      Genes
+    )
+  )
+
+data_unique <- make_unique(
+  mat_dep,
+  names = "Genes_clean",
+  ids = "Protein.Group",
+  delim = ";"
+)
+
+cat("Input muscle proteins:", nrow(mat_dep), "\n")
+cat("Unique proteins after make_unique:", nrow(data_unique), "\n")
+cat("Missing names after cleanup:", sum(is.na(data_unique$name) | data_unique$name == ""), "\n")
+cat("Missing IDs after cleanup:", sum(is.na(data_unique$ID) | data_unique$ID == ""), "\n")
+```
+
+
+## Create a DEP2 SummarizedExperiment object from the muscle-specific protein matrix.
+```{r}
+
+
+data_se <- make_se(
+  data_unique,
+  columns = exp_design_muscle$label,
+  expdesign = exp_design_muscle
+)
+
+cat("Proteins in DEP2 object:", nrow(data_se), "\n")
+cat("Samples in DEP2 object:", ncol(data_se), "\n")
+```
+
+## Summarize protein completeness before DEP2 filtering.
+```{r}
+det_counts <- rowSums(!is.na(assay(data_se)))
+
+summary(det_counts)
+
+cat(
+  "Proteins detected in all 38 samples:",
+  sum(det_counts == 38),
+  "\n"
+)
+
+cat(
+  "Proteins detected in at least 50% of samples:",
+  sum(det_counts >= 19),
+  "\n"
+)
+
+cat(
+  "Proteins detected in only one sample:",
+  sum(det_counts == 1),
+  "\n"
+)
+```
+
+## Filter proteins based on replicate completeness within conditions.
+```{r}
+
+data_filt <- filter_se(
+  data_se,
+  thr = MIN_DETECT_FRAC
+)
+
+cat("Proteins before filtering:", nrow(data_se), "\n")
+cat("Proteins after filtering:", nrow(data_filt), "\n")
+cat("Proteins removed:", nrow(data_se) - nrow(data_filt), "\n")
+```
+
+## Examine how many proteins were retained by DEP filtering.
+```{r}
+
+cat(
+  "Percent retained:",
+  round(100 * nrow(data_filt) / nrow(data_se), 1),
+  "%\n"
+)
+
+cat(
+  "Percent removed:",
+  round(100 * (nrow(data_se) - nrow(data_filt)) / nrow(data_se), 1),
+  "%\n"
+)
+```
+
+## Apply variance stabilizing normalization (VSN).
+```{r}
+data_norm <- normalize_vsn(data_filt)
+
+cat("Proteins after normalization:", nrow(data_norm), "\n")
+cat("Samples after normalization:", ncol(data_norm), "\n")
+```
+
+## Visualize sample intensity distributions after VSN normalization.
+```{r}
+
+plot_normalization(data_norm)
+```
+
+
+## Quantify missing values before imputation.
+```{r}
+miss_by_sample <- data.frame(
+  sample = colnames(assay(data_norm)),
+  frac_missing = colMeans(is.na(assay(data_norm)))
+)
+
+summary(miss_by_sample$frac_missing)
+
+cat(
+  "Mean sample missingness:",
+  round(mean(miss_by_sample$frac_missing) * 100, 1),
+  "%\n"
+)
+
+cat(
+  "Maximum sample missingness:",
+  round(max(miss_by_sample$frac_missing) * 100, 1),
+  "%\n"
+)
+```
+
+## Identify samples with the highest missingness.
+```{r}
+miss_by_sample %>%
+  dplyr::arrange(desc(frac_missing)) %>%
+  head(10)
+```
+
+
+## Create a metadata table using the DEP2 sample names.
+```{r}
+
+sample_meta <- as.data.frame(colData(data_norm))
+sample_meta$sample <- rownames(sample_meta)
+
+head(sample_meta[, c("sample", "condition", "sex", "age", "environment")])
+```
+
+## Compare missingness by sex using DEP2 sample names
+```{r}
+miss_by_sample <- data.frame(
+  sample = colnames(assay(data_norm)),
+  frac_missing = colMeans(is.na(assay(data_norm)))
+)
+
+sample_meta <- as.data.frame(colData(data_norm))
+sample_meta$sample <- rownames(sample_meta)
+
+miss_by_sample <- miss_by_sample %>%
+  dplyr::left_join(
+    sample_meta %>%
+      dplyr::select(sample, condition, sex, age, environment),
+    by = "sample"
+  )
+
+miss_by_sample %>%
+  dplyr::group_by(sex) %>%
+  dplyr::summarise(
+    mean_missing = mean(frac_missing),
+    sd_missing = sd(frac_missing),
+    n = dplyr::n()
+  )
+```
+
+## Visualize missingness by sex and environment.
+```{r}
+
+ggplot(
+  miss_by_sample,
+  aes(x = sex, y = frac_missing, fill = environment)
+) +
+  geom_boxplot(outlier.alpha = 0.4) +
+  geom_jitter(
+    width = 0.15,
+    size = 2,
+    alpha = 0.8
+  ) +
+  theme_bw() +
+  labs(
+    title = "Missingness in muscle proteome by sex and environment",
+    x = NULL,
+    y = "Fraction missing"
+  )
+```
+
+## Mean missingness by sex and environment.
+```{r}
+miss_by_sample %>%
+  group_by(sex, environment) %>%
+  summarise(
+    mean_missing = mean(frac_missing),
+    sd_missing = sd(frac_missing),
+    n = n(),
+    .groups = "drop"
+  )
+```
+
+## Number of quantified proteins per sample after DEP filtering.
+```{r}
+detected_per_sample <- colSums(!is.na(assay(data_filt)))
+
+det_df <- data.frame(
+  sample = names(detected_per_sample),
+  detected = detected_per_sample
+) %>%
+  left_join(
+    sample_meta %>%
+      dplyr::select(sample, sex, age, environment),
+    by = "sample"
+  )
+
+det_df %>%
+  group_by(sex) %>%
+  summarise(
+    mean_detected = mean(detected),
+    sd_detected = sd(detected),
+    min_detected = min(detected),
+    max_detected = max(detected),
+    n = n(),
+    .groups = "drop"
+  )
+```
+The sex separation is accompanied by a massive difference in proteome coverage.
+Because all female samples were processed in one acquisition set and all male samples in another, sex and batch are completely confounded. Consequently, sex-related differences cannot be distinguished from batch effects and were not interpreted biologically.
+
+## Impute missing values using DEP2's MinProb method.
+```{r}
+
+data_imp <- impute(
+  data_norm,
+  fun = "MinProb",
+  q = 0.01
+)
+
+cat("Proteins after imputation:", nrow(data_imp), "\n")
+cat("Samples after imputation:", ncol(data_imp), "\n")
+
+cat(
+  "Remaining missing values:",
+  sum(is.na(assay(data_imp))),
+  "\n"
+)
+```
+
+## Visualize intensity distributions after normalization and after imputation.
+```{r}
+
+par(mfrow = c(1, 2))
+
+boxplot(
+  assay(data_norm),
+  outline = FALSE,
+  las = 2,
+  main = "After VSN normalization",
+  ylab = "Log2 intensity"
+)
+
+boxplot(
+  assay(data_imp),
+  outline = FALSE,
+  las = 2,
+  main = "After MinProb imputation",
+  ylab = "Log2 intensity"
+)
+
+par(mfrow = c(1, 1))
+```
+
+## Density distributions before and after imputation.
+```{r}
+
+par(mfrow = c(1, 2))
+
+plot(
+  density(assay(data_norm)[, 1], na.rm = TRUE),
+  main = "VSN normalized",
+  xlab = "Log2 intensity"
+)
+
+for(i in 2:ncol(assay(data_norm))) {
+  lines(
+    density(assay(data_norm)[, i], na.rm = TRUE),
+    col = rgb(0, 0, 0, 0.2)
+  )
+}
+
+plot(
+  density(assay(data_imp)[, 1]),
+  main = "After MinProb imputation",
+  xlab = "Log2 intensity"
+)
+
+for(i in 2:ncol(assay(data_imp))) {
+  lines(
+    density(assay(data_imp)[, i]),
+    col = rgb(0, 0, 0, 0.2)
+  )
+}
+
+par(mfrow = c(1, 1))
+```
+
+
+## PCA using all filtered proteins after normalization and imputation.
+```{r}
+mat_pca <- assay(data_imp)
+
+pca_all <- prcomp(
+  t(mat_pca),
+  center = TRUE,
+  scale. = TRUE
+)
+
+pca_var_all <- round(
+  100 * (pca_all$sdev^2 / sum(pca_all$sdev^2)),
+  1
+)
+
+pca_var_all[1:5]
+```
+
+## Create PCA dataframe from imputed muscle data.
+```{r}
+
+pca_df <- as.data.frame(pca_all$x[, 1:2]) %>%
+  tibble::rownames_to_column("sample") %>%
+  dplyr::bind_cols(
+    as.data.frame(colData(data_imp))
+  )
+
+head(
+  pca_df[, c("sample", "sex", "age", "environment")]
+)
+```
+
+## Inspect PCA metadata columns using the available sample column name.
+
+```{r}
+
+head(
+  pca_df[, c("sample...1", "sex", "age", "environment")]
+)
+```
+
+## PCA coloured by sex and shaped by environment.
+
+```{r}
+
+ggplot(
+  pca_df,
+  aes(
+    PC1,
+    PC2,
+    color = sex,
+    shape = environment
+  )
+) +
+  geom_point(size = 4) +
+  geom_text(
+    aes(label = gsub("wk", "", age)),
+    vjust = -0.8,
+    size = 4
+  ) +
+  theme_bw() +
+  labs(
+    title = "Muscle PCA after filtering, VSN normalization and imputation",
+    x = paste0("PC1 (", pca_var_all[1], "%)"),
+    y = paste0("PC2 (", pca_var_all[2], "%)")
+  )
+```
+
+
+## Mean PC2 score by age.
+
+```{r}
+
+pca_df %>%
+  dplyr::group_by(age) %>%
+  dplyr::summarise(
+    mean_PC2 = mean(PC2),
+    sd_PC2 = sd(PC2),
+    n = dplyr::n()
+  )
+```
+
+
+## Visualize overall protein abundance per sample by environment and age.
+```{r}
+
+aprot_muscle <- assay(data_imp) %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Protein") %>%
+  tidyr::pivot_longer(
+    cols = -Protein,
+    names_to = "SampleID",
+    values_to = "PG_abundance"
+  ) %>%
+  dplyr::left_join(
+    sample_meta %>%
+      dplyr::select(
+        SampleID = sample,
+        age,
+        environment,
+        sex
+      ),
+    by = "SampleID"
+  ) %>%
+  dplyr::mutate(
+    EnvAge = paste0(
+      ifelse(environment == "Lab", "L", "M"),
+      gsub("wk", "", age)
+    ),
+    EnvAge = factor(EnvAge, levels = c("L8", "M8", "L18", "M18")),
+    AgeStage = factor(
+      ifelse(age == "8wk", "Young", "Middle"),
+      levels = c("Young", "Middle")
+    ),
+    Envt = factor(
+      ifelse(environment == "Lab", "L", "M"),
+      levels = c("L", "M")
+    )
+  )
+
+ggplot(
+  aprot_muscle,
+  aes(x = EnvAge, y = PG_abundance, color = Envt)
+) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  geom_jitter(width = 0.2, height = 0, alpha = 0.15, size = 0.4) +
+  facet_wrap(~ AgeStage, scales = "free_x", drop = TRUE) +
+  theme_bw() +
+  labs(
+    title = "Overall muscle protein abundance",
+    x = "Environment and age",
+    y = "Protein-group abundance",
+    color = "Environment"
+  )
+```
+
+## Test whether overall protein abundance differs between 8-week and 18-week muscle samples.
+
+```{r}
+
+subset_data <- aprot_muscle %>%
+  dplyr::filter(AgeStage %in% c("Young", "Middle"))
+
+t_test_age <- t.test(
+  PG_abundance ~ AgeStage,
+  data = subset_data
+)
+
+t_test_age
+```
+
+
+## Pairwise tests of overall protein abundance among L8, M8, L18, and M18.
+```{r}
+pairwise.t.test(
+  aprot_muscle$PG_abundance,
+  aprot_muscle$EnvAge,
+  p.adjust.method = "BH"
+)
+```
+
+age signal is real and that environment effects may strengthen with age.
+
+## Volcano plot: M8 vs L8
+```{r}
+
+
+group1 <- rownames(sample_meta)[sample_meta$condition == "M_8FL"]
+group2 <- rownames(sample_meta)[sample_meta$condition == "M_8FM"]
+
+mat <- assay(data_imp)
+
+log2_fc <- rowMeans(mat[, group2]) - rowMeans(mat[, group1])
+
+p_values <- apply(
+  mat[, c(group1, group2)],
+  1,
+  function(x) {
+    g1 <- x[1:length(group1)]
+    g2 <- x[(length(group1) + 1):length(x)]
+    t.test(g1, g2)$p.value
+  }
+)
+
+v_data <- data.frame(
+  Protein = rownames(mat),
+  log2FC = log2_fc,
+  p_value = p_values
+)
+
+v_data$neg_log10P <- -log10(v_data$p_value)
+
+log2FC_thresh <- 1
+pval_thresh <- -log10(0.05)
+
+v_data$category <- with(
+  v_data,
+  ifelse(
+    abs(log2FC) > log2FC_thresh & neg_log10P > pval_thresh,
+    "Significant Both",
+    ifelse(
+      abs(log2FC) > log2FC_thresh,
+      "Significant Log2FC",
+      ifelse(
+        neg_log10P > pval_thresh,
+        "Significant P-value",
+        "Not Significant"
+      )
+    )
+  )
+)
+
+library(ggrepel)
+
+ggplot(
+  v_data,
+  aes(log2FC, neg_log10P, color = category)
+) +
+  geom_point(alpha = 0.6) +
+  geom_vline(
+    xintercept = c(-1, 1),
+    linetype = "dashed"
+  ) +
+  geom_hline(
+    yintercept = -log10(0.05),
+    linetype = "dashed"
+  ) +
+  geom_text_repel(
+    aes(
+      label = ifelse(
+        category == "Significant Both",
+        Protein,
+        ""
+      )
+    ),
+    max.overlaps = 15,
+    size = 3
+  ) +
+  scale_color_manual(
+    values = c(
+      "Not Significant" = "grey80",
+      "Significant P-value" = "black",
+      "Significant Log2FC" = "#009E73",
+      "Significant Both" = "orange"
+    )
+  ) +
+  labs(
+    title = "Mesocosm vs Lab (8 wk)",
+    x = "Log2 Fold Change",
+    y = "-log10(p-value)"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "none"
+  )
+```
+
+
+## Volcano plot: Mesocosm vs Lab at 8 weeks (female samples)
+## Uses gene names and BH-adjusted p-values.
+##improvements
+```{r}
+library(ggrepel)
+
+group_lab <- rownames(sample_meta)[sample_meta$condition == "M_8FL"]
+group_meso <- rownames(sample_meta)[sample_meta$condition == "M_8FM"]
+
+mat <- assay(data_imp)
+
+## Calculate log2 fold change.
+log2_fc <- rowMeans(mat[, group_meso]) -
+           rowMeans(mat[, group_lab])
+
+## Protein-wise t-tests.
+p_values <- apply(
+  mat[, c(group_lab, group_meso)],
+  1,
+  function(x) {
+    g1 <- x[1:length(group_lab)]
+    g2 <- x[(length(group_lab) + 1):length(x)]
+    t.test(g1, g2)$p.value
+  }
+)
+
+## FDR correction.
+padj <- p.adjust(p_values, method = "BH")
+
+## Get gene names from DEP2 object.
+gene_names <- rowData(data_imp)$name
+
+v_data <- data.frame(
+  Protein = rownames(mat),
+  Gene = gene_names,
+  log2FC = log2_fc,
+  p_value = p_values,
+  padj = padj
+)
+
+## Use protein ID if gene name missing.
+v_data$Gene[is.na(v_data$Gene) | v_data$Gene == ""] <-
+  v_data$Protein[is.na(v_data$Gene) | v_data$Gene == ""]
+
+v_data$neg_log10_FDR <- -log10(v_data$padj)
+
+## Thresholds.
+fc_cutoff <- 1
+fdr_cutoff <- 0.05
+
+v_data$category <- with(
+  v_data,
+  ifelse(
+    abs(log2FC) > fc_cutoff & padj < fdr_cutoff,
+    "FDR + FC",
+    ifelse(
+      padj < fdr_cutoff,
+      "FDR only",
+      ifelse(
+        abs(log2FC) > fc_cutoff,
+        "FC only",
+        "Not significant"
+      )
+    )
+  )
+)
+
+## Label strongest FDR+FC hits.
+label_df <- v_data %>%
+  dplyr::filter(category == "FDR + FC") %>%
+  dplyr::arrange(padj) %>%
+  dplyr::slice_head(n = 25)
+
+n_sig <- sum(v_data$category == "FDR + FC")
+
+ggplot(
+  v_data,
+  aes(log2FC, neg_log10_FDR, color = category)
+) +
+  geom_point(alpha = 0.6, size = 1.8) +
+  geom_vline(
+    xintercept = c(-fc_cutoff, fc_cutoff),
+    linetype = "dashed"
+  ) +
+  geom_hline(
+    yintercept = -log10(fdr_cutoff),
+    linetype = "dashed"
+  ) +
+  geom_text_repel(
+    data = label_df,
+    aes(label = Gene),
+    size = 3,
+    max.overlaps = 50
+  ) +
+  scale_color_manual(
+    values = c(
+      "Not significant" = "grey80",
+      "FC only" = "#1b9e77",
+      "FDR only" = "black",
+      "FDR + FC" = "#d95f02"
+    )
+  ) +
+  theme_bw() +
+  labs(
+    title = paste0(
+      "Mesocosm vs Lab (8 wk females)\n",
+      n_sig,
+      " proteins pass FDR < 0.05 and |log2FC| > 1"
+    ),
+    x = "Log2 fold change (Mesocosm / Lab)",
+    y = "-log10(FDR)"
+  )
+```
+
+
+
+## M18 vs M8 volcano using the DEP2-imputed muscle dataset.
+```{r}
+
+library(ggrepel)
+
+group_M8 <- rownames(sample_meta)[sample_meta$condition == "M_8FM"]
+group_M18 <- rownames(sample_meta)[sample_meta$condition == "M_18FM"]
+
+mat <- assay(data_imp)
+
+## Compute log2 fold changes.
+log2_fc <- rowMeans(mat[, group_M18]) -
+           rowMeans(mat[, group_M8])
+
+## Protein-wise t-tests.
+p_values <- apply(
+  mat[, c(group_M8, group_M18)],
+  1,
+  function(x) {
+    g1 <- x[1:length(group_M8)]
+    g2 <- x[(length(group_M8) + 1):length(x)]
+    t.test(g1, g2)$p.value
+  }
+)
+
+## Gene names.
+gene_names <- rowData(data_imp)$name
+
+v_data <- data.frame(
+  Protein = rownames(mat),
+  Gene = gene_names,
+  log2FC = log2_fc,
+  p_value = p_values
+)
+
+v_data$Gene[is.na(v_data$Gene) | v_data$Gene == ""] <-
+  v_data$Protein[is.na(v_data$Gene) | v_data$Gene == ""]
+
+v_data$neg_log10P <- -log10(v_data$p_value)
+
+## Thresholds.
+log2FC_thresh <- 1
+pval_thresh <- -log10(0.05)
+
+v_data$category <- with(
+  v_data,
+  ifelse(
+    abs(log2FC) > log2FC_thresh &
+      neg_log10P > pval_thresh,
+    "Significant Both",
+    ifelse(
+      abs(log2FC) > log2FC_thresh,
+      "Significant Log2FC",
+      ifelse(
+        neg_log10P > pval_thresh,
+        "Significant P-value",
+        "Not Significant"
+      )
+    )
+  )
+)
+
+## Volcano plot.
+mm18 <- ggplot(
+  v_data,
+  aes(
+    x = log2FC,
+    y = neg_log10P,
+    color = category
+  )
+) +
+  geom_point(alpha = 0.6) +
+  geom_vline(
+    xintercept = c(-1, 1),
+    linetype = "dashed"
+  ) +
+  geom_hline(
+    yintercept = -log10(0.05),
+    linetype = "dashed"
+  ) +
+  geom_text_repel(
+    aes(
+      label = ifelse(
+        category == "Significant Both",
+        Gene,
+        ""
+      )
+    ),
+    box.padding = 0.5,
+    max.overlaps = 20,
+    size = 3
+  ) +
+  scale_color_manual(
+    values = c(
+      "Not Significant" = "gray85",
+      "Significant P-value" = "gray5",
+      "Significant Log2FC" = "#009E73",
+      "Significant Both" = "orange"
+    )
+  ) +
+  theme_bw() +
+  labs(
+    title = "Mesocosm 18 wk vs 8 wk",
+    x = "Log2 Fold Change",
+    y = "-log10(p-value)"
+  ) +
+  theme(
+    legend.position = "none"
+  )
+
+mm18
+```
+
+
+## Define a reusable function for volcano plots from the DEP2-imputed muscle dataset.
+```{r}
+
+library(ggrepel)
+
+make_muscle_volcano <- function(group1, group2, plot_title) {
+  
+  mat <- assay(data_imp)
+  
+  group1_samples <- rownames(sample_meta)[sample_meta$condition == group1]
+  group2_samples <- rownames(sample_meta)[sample_meta$condition == group2]
+  
+  log2_fc <- rowMeans(mat[, group2_samples]) -
+    rowMeans(mat[, group1_samples])
+  
+  p_values <- apply(
+    mat[, c(group1_samples, group2_samples)],
+    1,
+    function(x) {
+      g1 <- x[1:length(group1_samples)]
+      g2 <- x[(length(group1_samples) + 1):length(x)]
+      t.test(g1, g2)$p.value
+    }
+  )
+  
+  gene_names <- rowData(data_imp)$name
+  
+  v_data <- data.frame(
+    Protein = rownames(mat),
+    Gene = gene_names,
+    log2FC = log2_fc,
+    p_value = p_values
+  )
+  
+  v_data$Gene[is.na(v_data$Gene) | v_data$Gene == ""] <-
+    v_data$Protein[is.na(v_data$Gene) | v_data$Gene == ""]
+  
+  v_data$neg_log10P <- -log10(v_data$p_value)
+  
+  log2FC_thresh <- 1
+  pval_thresh <- -log10(0.05)
+  
+  v_data$category <- with(
+    v_data,
+    ifelse(
+      abs(log2FC) > log2FC_thresh & neg_log10P > pval_thresh,
+      "Significant Both",
+      ifelse(
+        abs(log2FC) > log2FC_thresh,
+        "Significant Log2FC",
+        ifelse(
+          neg_log10P > pval_thresh,
+          "Significant P-value",
+          "Not Significant"
+        )
+      )
+    )
+  )
+  
+  label_df <- v_data %>%
+    dplyr::filter(category == "Significant Both") %>%
+    dplyr::arrange(p_value) %>%
+    dplyr::slice_head(n = 20)
+  
+  p <- ggplot(
+    v_data,
+    aes(x = log2FC, y = neg_log10P, color = category)
+  ) +
+    geom_point(alpha = 0.6) +
+    geom_vline(
+      xintercept = c(-log2FC_thresh, log2FC_thresh),
+      linetype = "dashed"
+    ) +
+    geom_hline(
+      yintercept = pval_thresh,
+      linetype = "dashed"
+    ) +
+    geom_text_repel(
+      data = label_df,
+      aes(label = Gene),
+      box.padding = 0.5,
+      max.overlaps = 20,
+      size = 3
+    ) +
+    scale_color_manual(
+      values = c(
+        "Not Significant" = "gray85",
+        "Significant P-value" = "gray5",
+        "Significant Log2FC" = "#009E73",
+        "Significant Both" = "orange"
+      )
+    ) +
+    theme_bw() +
+    labs(
+      title = plot_title,
+      x = paste0("Log2 fold change (", group2, " / ", group1, ")"),
+      y = "-log10(p-value)"
+    ) +
+    theme(
+      legend.position = "none"
+    )
+  
+  return(
+    list(
+      plot = p,
+      data = v_data
+    )
+  )
+}
+```
+
+
+## Generate the four main muscle volcano plots.
+```{r}
+
+volc_M8_vs_L8 <- make_muscle_volcano(
+  group1 = "M_8FL",
+  group2 = "M_8FM",
+  plot_title = "Mesocosm vs Lab at 8 wk"
+)
+
+volc_M18_vs_L18 <- make_muscle_volcano(
+  group1 = "M_18FL",
+  group2 = "M_18FM",
+  plot_title = "Mesocosm vs Lab at 18 wk"
+)
+
+volc_L18_vs_L8 <- make_muscle_volcano(
+  group1 = "M_8FL",
+  group2 = "M_18FL",
+  plot_title = "Lab aging: 18 wk vs 8 wk"
+)
+
+volc_M18_vs_M8 <- make_muscle_volcano(
+  group1 = "M_8FM",
+  group2 = "M_18FM",
+  plot_title = "Mesocosm aging: 18 wk vs 8 wk"
+)
+```
+
+
+## Display the Mesocosm aging volcano plot.
+
+```{r}
+
+volc_M18_vs_M8$plot
+```
+
+
+## Arrange the four volcano plots into a 2 x 2 panel.
+```{r}
+
+library(ggpubr)
+
+volcano_panel <- ggarrange(
+  volc_M8_vs_L8$plot,
+  volc_M18_vs_L18$plot,
+  volc_L18_vs_L8$plot,
+  volc_M18_vs_M8$plot,
+  nrow = 2,
+  ncol = 2,
+  labels = c("A", "B", "C", "D")
+)
+
+volcano_panel
+```
+
+
+
+```{r}
+nrow(
+  subset(
+    volc_M8_vs_L8$data,
+    abs(log2FC) > 1 & p_value < 0.05
+  )
+)
+
+nrow(
+  subset(
+    volc_M18_vs_L18$data,
+    abs(log2FC) > 1 & p_value < 0.05
+  )
+)
+
+nrow(
+  subset(
+    volc_L18_vs_L8$data,
+    abs(log2FC) > 1 & p_value < 0.05
+  )
+)
+
+nrow(
+  subset(
+    volc_M18_vs_M8$data,
+    abs(log2FC) > 1 & p_value < 0.05
+  )
+)
+```
+
+
+## Define contrasts corresponding to the four volcano comparisons.
+```{r}
+
+cont.matrix <- makeContrasts(
+
+  M8_vs_L8 =
+    M_8FM - M_8FL,
+
+  M18_vs_L18 =
+    M_18FM - M_18FL,
+
+  L18_vs_L8 =
+    M_18FL - M_8FL,
+
+  M18_vs_M8 =
+    M_18FM - M_8FM,
+
+  levels = design
+)
+
+cont.matrix
+```
+Proteins meeting "nominal significance criteria"
+
+
+## Fit contrasts and apply empirical Bayes moderation.
+```{r}
+
+fit2 <- contrasts.fit(fit, cont.matrix)
+fit2 <- eBayes(fit2)
+
+summary(decideTests(fit2))
+```
+
+
+## Top proteins changing with Mesocosm aging.
+```{r}
+
+top_M18_vs_M8 <- topTable(
+  fit2,
+  coef = "M18_vs_M8",
+  number = 20,
+  sort.by = "P"
+)
+
+top_M18_vs_M8
+```
+Mesocosm aging is associated with decreased abundance of ribosomal and translation-related proteins and increased abundance of structural and contractile muscle proteins.
+
+
+## Examine the top 50 significant proteins.
+```{r}
+
+top50_M18_vs_M8 <- topTable(
+  fit2,
+  coef = "M18_vs_M8",
+  number = 50,
+  sort.by = "P"
+)
+
+sum(grepl("^RPL|^RPS|^MRPL|^MRPS", rownames(top50_M18_vs_M8)))
+```
+
+
+```{r}
+rownames(top50_M18_vs_M8)
+```
+
+
+```{r}
+sig_M18_vs_M8 <- topTable(
+  fit2,
+  coef = "M18_vs_M8",
+  number = Inf,
+  p.value = 0.05
+)
+
+nrow(sig_M18_vs_M8)
+```
+
+
+
+```{r}
+head(sig_M18_vs_M8[, c("logFC", "adj.P.Val")])
+```
+
+
+## Extract the top 50 significant proteins from Mesocosm aging.
+```{r}
+
+top50_ids <- rownames(
+  topTable(
+    fit2,
+    coef = "M18_vs_M8",
+    number = 50,
+    sort.by = "P"
+  )
+)
+
+length(top50_ids)
+
+head(top50_ids)
+```
+
+
+## Heatmap of the top 50 Mesocosm-aging proteins.
+```{r}
+
+library(pheatmap)
+
+meso_samples <- rownames(sample_meta)[
+  sample_meta$condition %in% c("M_8FM", "M_18FM")
+]
+
+heat_mat <- assay(data_imp)[top50_ids, meso_samples]
+
+## Z-score by protein.
+heat_mat_z <- t(scale(t(heat_mat)))
+
+annotation_col <- data.frame(
+  Age = sample_meta[meso_samples, "age"],
+  row.names = meso_samples
+)
+
+pheatmap(
+  heat_mat_z,
+  annotation_col = annotation_col,
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  clustering_method = "complete",
+  fontsize_row = 6,
+  main = "Top 50 proteins: Mesocosm aging (18 wk vs 8 wk)"
+)
+```
+
+Hierarchical clustering of the top 50 proteins differentially abundant between 8- and 18-week Mesocosm females reveal separation of age groups. Older fish exhibit increased abundance of structural and contractile proteins, including collagens and myofibrillar proteins, whereas numerous ribosomal and ribosome-biogenesis-associated proteins are reduced.
+
+
+## Heatmap of all significant proteins from Mesocosm aging
+#heatmap all 181
+```{r}
+
+
+library(pheatmap)
+
+sig_ids <- rownames(sig_M18_vs_M8)
+
+meso_samples <- rownames(sample_meta)[
+  sample_meta$condition %in% c("M_8FM", "M_18FM")
+]
+
+heat_mat <- assay(data_imp)[sig_ids, meso_samples]
+
+## Z-score by protein.
+heat_mat_z <- t(scale(t(heat_mat)))
+
+annotation_col <- data.frame(
+  Age = sample_meta[meso_samples, "age"],
+  row.names = meso_samples
+)
+
+pheatmap(
+  heat_mat_z,
+  annotation_col = annotation_col,
+  show_rownames = FALSE,
+  show_colnames = TRUE,
+  clustering_method = "complete",
+  fontsize_col = 10,
+  main = paste0(
+    "Mesocosm aging signature (",
+    length(sig_ids),
+    " proteins)"
+  )
+)
+```
+
+separates into M_8FM samples vs M_18FM samples, no mixing
+Differential abundance analysis identified 181 proteins significantly altered between 8- and 18-week mesocosm females (FDR < 0.05). Hierarchical clustering based on these proteins completely separated age groups, indicating age-associated proteomic signature. Proteins elevated in younger fish were enriched for ribosomal and translation-associated functions, whereas proteins elevated in older fish included contractile and extracellular matrix components.
+
+## Split heatmaps for proteins increased and decreased with Mesocosm aging.
+```{r}
+
+library(pheatmap)
+
+meso_samples <- rownames(sample_meta)[
+  sample_meta$condition %in% c("M_8FM", "M_18FM")
+]
+
+annotation_col <- data.frame(
+  Age = sample_meta[meso_samples, "age"],
+  row.names = meso_samples
+)
+
+## Up with age
+up_ids <- rownames(up_M18_vs_M8)
+
+heat_up <- assay(data_imp)[up_ids, meso_samples]
+heat_up_z <- t(scale(t(heat_up)))
+
+pheatmap(
+  heat_up_z,
+  annotation_col = annotation_col,
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  clustering_method = "complete",
+  fontsize_row = 7,
+  main = paste0(
+    "Proteins increased with Mesocosm aging (",
+    length(up_ids),
+    " proteins)"
+  )
+)
+
+## Down with age
+down_ids <- rownames(down_M18_vs_M8)
+
+heat_down <- assay(data_imp)[down_ids, meso_samples]
+heat_down_z <- t(scale(t(heat_down)))
+
+pheatmap(
+  heat_down_z,
+  annotation_col = annotation_col,
+  show_rownames = FALSE,
+  show_colnames = TRUE,
+  clustering_method = "complete",
+  fontsize_col = 10,
+  main = paste0(
+    "Proteins decreased with Mesocosm aging (",
+    length(down_ids),
+    " proteins)"
+  )
+)
+```
+
+Aging signal is much stronger than within-group variation, there is a coordinated reduction in the protein synthesis machinery during mesocosm muscle aging
+Higher abundance at 8 wk
+Lower abundance at 18 wk
+
+##important question still to ask (M18−M8)−(L18−L8): Which proteins change with age in Mesocosm but not in Lab?/Which proteins age differently between environments?
+## so frar results hint that there is little age-related proteomic remodeling in lab and there are strong age-related remodeling in meso
+#add contrasts
+
+```{r}
+cont.matrix <- makeContrasts(
+  M8_vs_L8   = M_8FM  - M_8FL,
+  M18_vs_L18 = M_18FM - M_18FL,
+  L18_vs_L8  = M_18FL - M_8FL,
+  M18_vs_M8  = M_18FM - M_8FM,
+
+  Age_by_Environment =
+    (M_18FM - M_8FM) -
+    (M_18FL - M_8FL),
+
+  levels = design
+)
+```
+
+
+#Refit
+```{r}
+up_M18_vs_M8 <- sig_M18_vs_M8[
+  sig_M18_vs_M8$logFC > 0,
+]
+
+down_M18_vs_M8 <- sig_M18_vs_M8[
+  sig_M18_vs_M8$logFC < 0,
+]
+
+nrow(up_M18_vs_M8)
+nrow(down_M18_vs_M8)
+
+fit2 <- contrasts.fit(fit, cont.matrix)
+fit2 <- eBayes(fit2)
+
+summary(decideTests(fit2))
+```
+
+detect no proteins whose age-related change differs significantly between Mesocosm and Lab at the FDR threshold?????
+summary(decideTests(fit2))
+       M8_vs_L8 M18_vs_L18 L18_vs_L8 M18_vs_M8 Age_by_Environment
+Down          2          5         0       129                  0
+NotSig     2671       2668      2675      2494               2675
+Up            2          2         0        52                  0
+
+
+```{r}
+top_interaction <- topTable(
+  fit2,
+  coef = "Age_by_Environment",
+  number = 20
+)
+
+top_interaction[, c("logFC", "P.Value", "adj.P.Val")]
+```
+
+#visualise the genes that show near-significant interaction effects
+
+```{r}
+
+## Visualize multiple interaction-candidate proteins across female groups.
+## Age is grouped first, with Lab and Mesocosm shown within each age.
+
+genes_to_plot <- c(
+  "PVALB7",
+  "MYLPFA",
+  "CASQ1A",
+  "COL1A1B",
+  "MYH7B",
+  "MRPL39.1"
+)
+
+plot_multi_df <- assay(data_imp)[genes_to_plot, ] %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Protein") %>%
+  tidyr::pivot_longer(
+    cols = -Protein,
+    names_to = "sample",
+    values_to = "abundance"
+  ) %>%
+  dplyr::left_join(
+    sample_meta %>%
+      dplyr::select(sample, condition, age, environment, sex),
+    by = "sample"
+  ) %>%
+  dplyr::filter(
+    sex == "Female",
+    condition %in% c("M_8FL", "M_18FL", "M_8FM", "M_18FM")
+  ) %>%
+  dplyr::mutate(
+    age = factor(age, levels = c("8wk", "18wk")),
+    environment = factor(environment, levels = c("Lab", "Mesocosm"))
+  )
+
+ggplot(
+  plot_multi_df,
+  aes(x = age, y = abundance, fill = environment)
+) +
+  geom_boxplot(
+    outlier.shape = NA,
+    alpha = 0.6,
+    position = position_dodge(width = 0.75)
+  ) +
+  geom_jitter(
+    aes(color = environment),
+    position = position_jitterdodge(
+      jitter.width = 0.12,
+      dodge.width = 0.75
+    ),
+    size = 1.8,
+    alpha = 0.85
+  ) +
+  facet_wrap(~ Protein, scales = "free_y", ncol = 3) +
+  theme_bw() +
+  labs(
+    title = "Candidate age-by-environment proteins in female muscle",
+    x = "Age",
+    y = "Normalized/imputed abundance",
+    fill = "Environment",
+    color = "Environment"
+  ) +
+  theme(
+    legend.position = "bottom"
+  )
+  
+```
+
+
+
+#####summary???
+Aging-associated proteomic remodeling is most pronounced in mesocosm females. Differential abundance analysis identifies 181 proteins that change significantly between 8- and 18-week mesocosm females (FDR < 0.05), whereas no proteins reach significance in the corresponding laboratory aging comparison. Proteins that decrease with age are strongly enriched for cytoplasmic translation, ribosome biogenesis, and rRNA processing pathways, while proteins that increase with age are enriched for muscle contraction and muscle system processes.
+
+To determine whether aging trajectories differ significantly between environments, I tested an age-by-environment interaction contrast: (M_18FM − M_8FM) − (M_18FL − M_8FL). No proteins reach the FDR < 0.05 threshold in this formal interaction analysis. However, several biologically relevant proteins show near-significant interaction effects, including PVALB7 (interaction logFC = 4.18, FDR = 0.052), Nfu_g_1_015914.1 (logFC = 2.83, FDR = 0.052), MYLPFA (logFC = 4.47, FDR = 0.063), TPP2.1 (logFC = -3.04, FDR = 0.067), and Nfu_g_1_009250 (logFC = 3.01, FDR = 0.073). Additional proteins associated with muscle structure and contraction, including CASQ1A (FDR = 0.104), COL1A1B (FDR = 0.146), and MYH7B (FDR = 0.146), also rank among the strongest interaction candidates.
+
+Together, these results indicate age-associated proteomic remodeling in mesocosm muscle, characterized by reduced abundance of translation- and ribosome-associated proteins and increased abundance of contractile and structural muscle proteins. Although age-by-environment interactions do not survive multiple-testing correction, the near-significant interaction effects suggest that environmental context influences the magnitude of age-related proteomic remodeling and warrant further investigation in larger cohorts, may be???
+
+##plot those with strongest age * ednvironment interaction
+```{r}
+## Strongest candidate age-by-environment proteins.
+
+genes_to_plot <- c(
+  "PVALB7",
+  "MYLPFA",
+  "COL1A1B",
+  "MRPL39.1"
+)
+
+plot_df <- assay(data_imp)[genes_to_plot, ] %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Protein") %>%
+  tidyr::pivot_longer(
+    cols = -Protein,
+    names_to = "sample",
+    values_to = "abundance"
+  ) %>%
+  dplyr::left_join(
+    sample_meta %>%
+      dplyr::select(
+        sample,
+        condition,
+        age,
+        environment,
+        sex
+      ),
+    by = "sample"
+  ) %>%
+  dplyr::filter(
+    sex == "Female",
+    condition %in% c(
+      "M_8FL",
+      "M_18FL",
+      "M_8FM",
+      "M_18FM"
+    )
+  ) %>%
+  dplyr::mutate(
+    age = factor(age, levels = c("8wk", "18wk")),
+    environment = factor(
+      environment,
+      levels = c("Lab", "Mesocosm")
+    )
+  )
+
+ggplot(
+  plot_df,
+  aes(
+    x = age,
+    y = abundance,
+    fill = environment
+  )) +
+  geom_boxplot(
+    outlier.shape = NA,
+    alpha = 0.6,
+    position = position_dodge(width = 0.75)
+  ) +
+  geom_jitter(
+    aes(color = environment),
+    position = position_jitterdodge(
+      jitter.width = 0.08,
+      dodge.width = 0.75
+    ),
+    size = 2,
+    alpha = 0.85
+  ) +
+  facet_wrap(
+    ~ Protein,
+    scales = "free_y",
+    ncol = 2
+  ) +
+  theme_bw(base_size = 14) +
+  labs(
+    title = "Top candidate age-by-environment proteins",
+    x = "Age",
+    y = "Normalized/imputed abundance",
+    fill = "Environment",
+    color = "Environment"
+  ) +
+  theme(
+    legend.position = "bottom",
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(face = "bold")
+  )
+```
+
+PVALB7, MYLPFA, COL1A1B and MRPL39.1 were selected from the age-by-environment interaction analysis as representative candidate proteins. Interaction FDR values were 0.052, 0.063, 0.146 and 0.103, respectively.
+
+
+#strongest candidate age-by-environment proteins.
+## Shows age comparisons within Lab and Mesocosm females,
+## with interaction FDRs included in facet labels.
+```{r}
+
+library(ggpubr)
+library(rstatix)
+
+genes_to_plot <- c(
+  "PVALB7",
+  "MYLPFA",
+  "MRPL39.1",
+  "COL1A1B"
+)
+
+plot_df <- assay(data_imp)[genes_to_plot, ] %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Protein") %>%
+  tidyr::pivot_longer(
+    cols = -Protein,
+    names_to = "sample",
+    values_to = "abundance"
+  ) %>%
+  dplyr::left_join(
+    sample_meta %>%
+      dplyr::select(sample, condition, age, environment, sex),
+    by = "sample"
+  ) %>%
+  dplyr::filter(
+    sex == "Female",
+    condition %in% c("M_8FL", "M_18FL", "M_8FM", "M_18FM")
+  ) %>%
+  dplyr::mutate(
+    age = factor(age, levels = c("8wk", "18wk")),
+    environment = factor(environment, levels = c("Lab", "Mesocosm")),
+    group = factor(
+      paste(environment, age),
+      levels = c(
+        "Lab 8wk",
+        "Lab 18wk",
+        "Mesocosm 8wk",
+        "Mesocosm 18wk"
+      )
+    ),
+    Protein = factor(
+      Protein,
+      levels = c("PVALB7", "MYLPFA", "MRPL39.1", "COL1A1B"),
+      labels = c(
+        "PVALB7\n(interaction FDR = 0.052)",
+        "MYLPFA\n(interaction FDR = 0.063)",
+        "MRPL39.1\n(interaction FDR = 0.103)",
+        "COL1A1B\n(interaction FDR = 0.146)"
+      )
+    )
+  )
+
+stat_df <- plot_df %>%
+  dplyr::group_by(Protein, environment) %>%
+  rstatix::t_test(abundance ~ age) %>%
+  rstatix::add_significance("p") %>%
+  dplyr::mutate(
+    group1 = ifelse(environment == "Lab", "Lab 8wk", "Mesocosm 8wk"),
+    group2 = ifelse(environment == "Lab", "Lab 18wk", "Mesocosm 18wk")
+  ) %>%
+  dplyr::group_by(Protein) %>%
+  dplyr::mutate(
+    y.position = max(plot_df$abundance[plot_df$Protein == Protein[1]]) +
+      dplyr::row_number() * 0.45
+  ) %>%
+  dplyr::ungroup()
+
+candidate_plot <- ggplot(
+  plot_df,
+  aes(x = group, y = abundance, fill = environment)
+) +
+  geom_boxplot(
+    outlier.shape = NA,
+    alpha = 0.6
+  ) +
+  geom_jitter(
+    aes(color = environment),
+    width = 0.12,
+    size = 2,
+    alpha = 0.85
+  ) +
+  facet_wrap(
+    ~ Protein,
+    scales = "free_y",
+    ncol = 2
+  ) +
+  
+  stat_pvalue_manual(
+  stat_df,
+  label = "p.signif",
+  xmin = "group1",
+  xmax = "group2",
+  y.position = "y.position",
+  tip.length = 0.01
+)
+   +
+  scale_x_discrete(
+    labels = c(
+      "Lab\n8wk",
+      "Lab\n18wk",
+      "Mesocosm\n8wk",
+      "Mesocosm\n18wk"
+    )
+  ) +
+  theme_bw(base_size = 14) +
+  labs(
+    title = "Proteins exhibiting stronger age-related changes in Mesocosm females",
+    x = NULL,
+    y = "Normalized/imputed abundance",
+    fill = "Environment",
+    color = "Environment"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 0, hjust = 0.5),
+    legend.position = "bottom",
+    strip.text = element_text(face = "bold", size = 11),
+    plot.title = element_text(face = "bold")
+  )
+
+candidate_plot
+   
+
+```
+
+"PVALB7 (FDR = 0.052) and MYLPFA (FDR = 0.063) exhibit evidence for age-by-environment interactions. MRPL39.1 (FDR = 0.103) and COL1A1B (FDR = 0.146) show similar qualitative patterns but provide weaker statistical support."
+
+###look @ other proteins
+```{r}
+sum(top_interaction$adj.P.Val < 0.05)
+sum(top_interaction$adj.P.Val < 0.10)
+sum(top_interaction$adj.P.Val < 0.15)
+sum(top_interaction$adj.P.Val < 0.20)
+```
+
+
+## Extract interaction candidate genes.
+```{r}
+
+interaction_genes <- unique(
+  rowData(data_imp)[rownames(interaction20), "name"]
+)
+
+interaction_genes <- interaction_genes[
+  !is.na(interaction_genes) &
+  interaction_genes != ""
+]
+
+sort(interaction_genes)
+length(interaction_genes)
+```
+
+
+```{r}
+
+clean_gene_symbol <- function(x) {
+  x <- toupper(x)
+  x <- sub("\\.[0-9]+$", "", x)
+  x
+}
+
+interaction_genes_clean <- unique(
+  clean_gene_symbol(interaction_genes)
+)
+
+length(interaction_genes_clean)
+
+interaction_genes_clean
+
+```
+
+
+```{r}
+interaction_map <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = interaction_genes_clean,
+  keytype = "SYMBOL",
+  columns = c("SYMBOL", "ENTREZID")
+)
+
+interaction_map <- interaction_map %>%
+  dplyr::filter(!is.na(ENTREZID)) %>%
+  dplyr::distinct(SYMBOL, ENTREZID)
+
+cat(
+  "Mapped:",
+  nrow(interaction_map),
+  "of",
+  length(interaction_genes_clean),
+  "genes\n"
+)
+
+interaction_map
+```
+
+
+```{r}
+nrow(interaction_map)
+head(interaction_map)
+```
+
+
+
+#save files
+```{r}
+## Significant proteins increased with age.
+
+up_M18_vs_M8 <- sig_M18_vs_M8 %>%
+  dplyr::filter(logFC > 0)
+
+## Significant proteins decreased with age.
+
+down_M18_vs_M8 <- sig_M18_vs_M8 %>%
+  dplyr::filter(logFC < 0)
+
+cat("Up with age:", nrow(up_M18_vs_M8), "\n")
+cat("Down with age:", nrow(down_M18_vs_M8), "\n")
+
+head(rownames(up_M18_vs_M8))
+head(rownames(down_M18_vs_M8))
+```
+
+#genes with recognizable symbols
+```{r}
+sum(
+  !grepl(
+    "^Nfu_g_|^LOC|^G4P62_|^A0A",
+    rownames(sig_M18_vs_M8)
+  )
+)
+```
+
+###use actual gene names stored in dep2 rather than rownames 
+```{r}
+## Get gene annotations for significant proteins.
+
+sig_genes <- rowData(data_imp)[rownames(sig_M18_vs_M8), "name"]
+
+head(sig_genes)
+```
+
+## Up-regulated genes.
+```{r}
+up_genes <- unique(
+  rowData(data_imp)[rownames(up_M18_vs_M8), "name"]
+)
+
+up_genes <- up_genes[
+  !is.na(up_genes) &
+  up_genes != ""
+]
+
+length(up_genes)
+
+## Down-regulated genes.
+
+down_genes <- unique(
+  rowData(data_imp)[rownames(down_M18_vs_M8), "name"]
+)
+
+down_genes <- down_genes[
+  !is.na(down_genes) &
+  down_genes != ""
+]
+
+length(down_genes)
+```
+
+
+#many unique gene symbols in each direction
+```{r}
+## Up-regulated genes.
+up_genes <- unique(
+  rowData(data_imp)[rownames(up_M18_vs_M8), "name"]
+)
+
+up_genes <- up_genes[
+  !is.na(up_genes) &
+  up_genes != ""
+]
+
+length(up_genes)
+
+## Down-regulated genes.
+
+down_genes <- unique(
+  rowData(data_imp)[rownames(down_M18_vs_M8), "name"]
+)
+
+down_genes <- down_genes[
+  !is.na(down_genes) &
+  down_genes != ""
+]
+
+length(down_genes)
+```
+Identical numbers because there are no duplicated gene names among the significant proteins.
+
+#quantify the ribosomal signal across all 181 proteins
+```{r}
+sum(
+  grepl(
+    "^RPL|^RPS|^MRPL|^MRPS",
+    rownames(sig_M18_vs_M8)
+  )
+)
+```
+
+#what fraction of the aging signature they represent
+```{r}
+round(
+  100 *
+    sum(
+      grepl(
+        "^RPL|^RPS|^MRPL|^MRPS",
+        rownames(sig_M18_vs_M8)
+      )
+    ) /
+    nrow(sig_M18_vs_M8),
+  1
+)
+```
+
+Mesocosm aging associated with significant remodeling of the translational machinery. Among the 181 proteins differentially abundant between 8- and 18-week Mesocosm females (FDR < 0.05), 43 (23.8%) were annotated as cytosolic or mitochondrial ribosomal proteins. Most ribosomal proteins decreased in abundance with age, suggesting reduced translational capacity and/or altered ribosome biogenesis in older muscle.
+
+
+#enrichment analysis
+```{r}
+#clean up
+## Examine the significant gene names.
+
+head(sort(unique(all_sig_genes)), 50)
+
+## Count genes with isoform suffixes.
+
+sum(grepl("\\.[0-9]+$", all_sig_genes))
+```
+
+###human-symbol-based enrichment of killifish gene names- zebra fish mapping only a few
+```{r}
+## Map cleaned significant muscle genes to human Entrez IDs.
+
+human_map <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = all_sig_genes_clean,
+  keytype = "SYMBOL",
+  columns = c("SYMBOL", "ENTREZID")
+)
+
+human_map_clean <- human_map %>%
+  dplyr::filter(!is.na(ENTREZID)) %>%
+  dplyr::distinct(SYMBOL, ENTREZID)
+
+cat("Cleaned input genes:", length(all_sig_genes_clean), "\n")
+cat("Human mapped genes:", nrow(human_map_clean), "\n")
+cat(
+  "Human mapping percentage:",
+  round(100 * nrow(human_map_clean) / length(all_sig_genes_clean), 1),
+  "%\n"
+)
+
+head(human_map_clean)
+```
+
+
+## Prepare cleaned up- and down-regulated gene lists for human enrichment.
+```{r}
+
+up_genes_clean <- unique(clean_gene_symbol(up_genes))
+down_genes_clean <- unique(clean_gene_symbol(down_genes))
+
+up_map <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = up_genes_clean,
+  keytype = "SYMBOL",
+  columns = c("SYMBOL", "ENTREZID")
+) %>%
+  dplyr::filter(!is.na(ENTREZID)) %>%
+  dplyr::distinct(SYMBOL, ENTREZID)
+
+down_map <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = down_genes_clean,
+  keytype = "SYMBOL",
+  columns = c("SYMBOL", "ENTREZID")
+) %>%
+  dplyr::filter(!is.na(ENTREZID)) %>%
+  dplyr::distinct(SYMBOL, ENTREZID)
+
+cat("Up genes:", length(up_genes_clean), "mapped:", nrow(up_map), "\n")
+cat("Down genes:", length(down_genes_clean), "mapped:", nrow(down_map), "\n")
+```
+Up:   47 genes → 18 mapped (interpret this enrichment with care.)
+Down: 128 genes → 96 mapped
+
+
+## GO Biological Process enrichment for proteins decreased with age in Mesocosm.
+```{r}
+
+ego_down <- enrichGO(
+  gene          = down_map$ENTREZID,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.20,
+  readable      = TRUE
+)
+
+ego_down_df <- as.data.frame(ego_down)
+
+head(
+  ego_down_df[, c("Description", "GeneRatio", "p.adjust", "Count")],
+  20
+)
+```
+
+These terms are kind of suprising: myoblast fusion,myotube differentiation, striated muscle contraction, muscle cell differentiation and muscle contraction
+Because they came from the down-regulated list. Looks contradictory because saw proteins like:MYH13,MYLPFA,COL12A1 and PVALB7 increase with age!
+
+May be many ribosomal proteins are annotated to muscle-development pathways because those pathways contain large numbers of translation-related genes??
+
+General conclusion: Proteins that decreased with age in Mesocosm females are strongly enriched for ribosomal proteins, cytoplasmic translation, ribosome biogenesis, and rRNA processing pathways.
+
+##enrich the up-regulated proteins
+```{r}
+ego_up <- enrichGO(
+  gene          = up_map$ENTREZID,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.20,
+  readable      = TRUE
+)
+
+ego_up_df <- as.data.frame(ego_up)
+
+head(
+  ego_up_df[, c("Description", "GeneRatio", "p.adjust", "Count")],
+  20
+)
+```
+cytoplasmic translation, 43/96 genes, FDR ≈ 4.7 × 10^-55
+Dominant biological process decreasing with age in Mesocosm muscle!
+muscle contraction
+muscle system process
+regulation of muscle contraction
+
+
+
+## Dotplot of GO enrichment for proteins decreased with age.
+
+```{r}
+
+
+library(enrichplot)
+
+dotplot(
+  ego_down,
+  showCategory = 15,
+  font.size = 12
+)
+```
+
+Redundant terms:negative regulation of myoblast fusion
+regulation of myoblast fusion
+myoblast fusion
+cell-cell fusion
+syncytium formation
+
+#Collapse redundant terms
+```{r}
+ego_down_simp <- simplify(
+  ego_down,
+  cutoff = 0.7,
+  by = "p.adjust",
+  select_fun = min
+)
+
+dotplot(
+  ego_down_simp,
+  showCategory = 15,
+  font.size = 12
+)
+```
+
+
+```{r}
+library(enrichplot)
+
+emapplot(
+  pairwise_termsim(ego_down_simp),
+  showCategory = 20
+)
+```
+
+#emmaplot
+```{r}
+
+```
+
+
+
+
+```{r}
+write.csv(sig_M18_vs_M8,
+          "Mesocosm_Aging_181_Proteins.csv")
+
+write.csv(as.data.frame(ego_down),
+          "Mesocosm_Aging_GO_Down.csv")
+
+write.csv(as.data.frame(ego_up),
+          "Mesocosm_Aging_GO_Up.csv")
+```
+
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+
+
+##################
+################
+############
+#######stop
+```{r}
+## Build the design matrix using the 8 muscle conditions.
+
+sample_meta <- as.data.frame(colData(data_imp))
+
+condition <- factor(sample_meta$condition)
+
+design <- model.matrix(~ 0 + condition)
+
+colnames(design) <- levels(condition)
+
+design
+```
+
+
+```{r}
+## Fit the limma model to the imputed muscle proteome.
+
+fit <- lmFit(
+  assay(data_imp),
+  design
+)
+
+fit
+```
+
+
+
+
+
+
+####
+```{r check-sample-columns}
+## Confirm that all muscle sample columns in the metadata are present in the protein matrix.
+
+missing_sample_cols <- setdiff(meta_muscle$sample_column, colnames(mat_raw))
+
+cat("Missing sample columns:", length(missing_sample_cols), "\n")
+if (length(missing_sample_cols) > 0) {
+  print(missing_sample_cols)
+  stop("Some muscle sample columns are not present in the protein matrix.")
+}
+```
+
+# 3. Create muscle matrix and experimental design
+
+```{r create-exp-design}
+## Create the experimental design table for DEP2 using muscle metadata.
+
+exp_design_muscle <- meta_muscle %>%
+  dplyr::arrange(group_name, sample) %>%
+  dplyr::group_by(group_name) %>%
+  dplyr::mutate(
+    condition = as.character(group_name),
+    replicate = dplyr::row_number()
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(
+    label = sample_column,
+    condition,
+    replicate,
+    tissue,
+    age,
+    environment,
+    sex,
+    sample,
+    group_name
+  )
+
+print(exp_design_muscle, n = Inf)
+```
+
+```{r create-muscle-matrix}
+## Create the muscle-specific protein matrix using the filtered muscle sample columns.
+
+sample_cols_muscle <- exp_design_muscle$label
+
+mat_muscle <- mat_raw %>%
+  dplyr::select(
+    Protein.Group,
+    Protein.Names,
+    Genes,
+    First.Protein.Description,
+    N.Sequences,
+    N.Proteotypic.Sequences,
+    dplyr::all_of(sample_cols_muscle)
+  )
+
+cat("Muscle matrix dimensions:", dim(mat_muscle), "\n")
+cat("Sample columns match experimental design:",
+    setequal(sample_cols_muscle, colnames(mat_muscle)[-(1:6)]), "\n")
+```
+
+# 4. Detection-depth QC before filtering
+
+```{r detected-proteins-per-sample}
+## Count detected protein groups per muscle sample before DEP2 filtering.
+
+pgs_per_sample <- tibble::tibble(
+  label = sample_cols_muscle,
+  n_PGs_detected = colSums(!is.na(mat_muscle[, sample_cols_muscle]) &
+                             mat_muscle[, sample_cols_muscle] > 0)
+) %>%
+  dplyr::left_join(exp_design_muscle, by = "label")
+
+pgs_per_sample %>%
+  dplyr::select(sample, group_name, age, environment, sex, n_PGs_detected) %>%
+  dplyr::arrange(n_PGs_detected) %>%
+  print(n = Inf)
+```
+
+```{r plot-detected-per-sample, fig.width=10, fig.height=5}
+## Visualize detected protein groups per sample to identify depth differences or outlier samples.
+
+ggplot(pgs_per_sample,
+       aes(x = reorder(sample, n_PGs_detected),
+           y = n_PGs_detected,
+           fill = sex)) +
+  geom_col() +
+  facet_grid(. ~ environment, scales = "free_x", space = "free_x") +
+  coord_flip() +
+  theme_bw(base_size = 12) +
+  labs(
+    title = "Detected protein groups per muscle sample",
+    x = NULL,
+    y = "Detected protein groups"
+  )
+```
+
+# 5. Detection overlap between environments
+
+```{r detection-overlap-counts}
+## Determine protein detection overlap between Lab and Mesocosm muscle samples.
+
+lab_cols <- exp_design_muscle$label[exp_design_muscle$environment == "Lab"]
+meso_cols <- exp_design_muscle$label[exp_design_muscle$environment == "Mesocosm"]
+
+lab_detected <- rowSums(mat_muscle[, lab_cols] > 0, na.rm = TRUE) > 0
+meso_detected <- rowSums(mat_muscle[, meso_cols] > 0, na.rm = TRUE) > 0
+
+lab_only_detected <- sum(lab_detected & !meso_detected)
+meso_only_detected <- sum(!lab_detected & meso_detected)
+shared_detected <- sum(lab_detected & meso_detected)
+
+cat("Lab only:", lab_only_detected, "\n")
+cat("Mesocosm only:", meso_only_detected, "\n")
+cat("Shared:", shared_detected, "\n")
+```
+
+```{r detection-venn, fig.width=7, fig.height=5}
+## Visualize protein detection overlap between Lab and Mesocosm muscle samples.
+
+shared <- shared_detected
+lab_only <- lab_only_detected
+meso_only <- meso_only_detected
+
+lab_total <- sum(lab_detected)
+meso_total <- sum(meso_detected)
+
+lab_only_pct <- round(100 * lab_only / lab_total, 1)
+meso_only_pct <- round(100 * meso_only / meso_total, 1)
+shared_lab_pct <- round(100 * shared / lab_total, 1)
+shared_meso_pct <- round(100 * shared / meso_total, 1)
+
+circle_df <- function(x0, y0, r, n = 500) {
+  theta <- seq(0, 2 * pi, length.out = n)
+  data.frame(x = x0 + r * cos(theta), y = y0 + r * sin(theta))
+}
+
+lab_circle <- circle_df(-0.8, 0, 1.5)
+meso_circle <- circle_df(0.8, 0, 1.5)
+
+venn_detection <- ggplot() +
+  geom_polygon(data = lab_circle, aes(x, y),
+               fill = "#9ecae1", color = "black", alpha = 0.6, linewidth = 1) +
+  geom_polygon(data = meso_circle, aes(x, y),
+               fill = "#fdd76e", color = "black", alpha = 0.6, linewidth = 1) +
+  annotate("text", x = -1.7, y = 0,
+           label = paste0(lab_only, "\n(", lab_only_pct, "%)"), size = 6) +
+  annotate("text", x = 0, y = 0,
+           label = paste0(shared, "\n", shared_lab_pct, "% of Lab\n",
+                          shared_meso_pct, "% of Meso"), size = 5) +
+  annotate("text", x = 1.7, y = 0,
+           label = paste0(meso_only, "\n(", meso_only_pct, "%)"), size = 6) +
+  annotate("text", x = -0.8, y = -1.85,
+           label = paste0("Lab\n(", lab_total, ")"), size = 5.5) +
+  annotate("text", x = 0.8, y = -1.85,
+           label = paste0("Mesocosm\n(", meso_total, ")"), size = 5.5) +
+  labs(title = "Detected muscle proteins") +
+  coord_equal(xlim = c(-2.8, 2.8), ylim = c(-2.2, 1.9)) +
+  theme_void() +
+  theme(plot.title = element_text(hjust = 0.5, size = 18))
+
+venn_detection
+```
+
+# 6. DEP2 identifier preparation and SummarizedExperiment construction
+
+```{r make-unique}
+## Prepare protein identifiers for DEP2 by creating a clean protein name column.
+
+mat_dep <- mat_muscle %>%
+  dplyr::mutate(
+    Genes_clean = ifelse(is.na(Genes) | Genes == "", Protein.Group, Genes)
+  )
+
+data_unique <- make_unique(
+  mat_dep,
+  names = "Genes_clean",
+  ids = "Protein.Group",
+  delim = ";"
+)
+
+cat("Input proteins:", nrow(mat_dep), "\n")
+cat("Unique proteins after make_unique:", nrow(data_unique), "\n")
+cat("Missing names after cleanup:", sum(is.na(data_unique$name) | data_unique$name == ""), "\n")
+cat("Missing IDs after cleanup:", sum(is.na(data_unique$ID) | data_unique$ID == ""), "\n")
+```
+
+```{r make-se}
+## Create a DEP2 SummarizedExperiment object for muscle samples.
+
+## Create a DEP2 SummarizedExperiment object for muscle samples.
+
+data_se <- make_se(
+  data_unique,
+  columns = exp_design_muscle$label,
+  expdesign = exp_design_muscle
+)
+
+cat("SummarizedExperiment dimensions:", dim(data_se), "\n")
+print(colData(data_se)[, c("condition", "age", "environment", "sex")])
+```
+
+# 7. DEP2 missing-value filtering
+
+```{r filter-missing}
+## Filter proteins by requiring detection in at least half of samples in at least one condition.
+
+assay_mat <- assay(data_se)
+conditions <- colData(data_se)$condition
+
+keep_by_group <- sapply(levels(factor(conditions)), function(g) {
+  group_cols <- which(conditions == g)
+  rowMeans(!is.na(assay_mat[, group_cols, drop = FALSE])) >= MIN_DETECT_FRAC
+})
+
+keep_protein <- rowSums(keep_by_group) >= 1
+
+data_filt <- data_se[keep_protein, ]
+
+cat("Proteins before filtering:", nrow(data_se), "\n")
+cat("Proteins after filtering:", nrow(data_filt), "\n")
+cat("Proteins removed:", nrow(data_se) - nrow(data_filt), "\n")
+```
+
+```{r dep2-qc-plots, fig.width=8, fig.height=5}
+## Generate DEP2 QC plots after protein filtering.
+
+plot_frequency(data_filt)
+plot_numbers(data_filt)
+plot_coverage(data_filt)
+```
+
+# 8. DEP2 normalization and imputation
+
+```{r normalize-vsn}
+## Normalize filtered muscle protein intensities using DEP2 VSN normalization.
+
+data_norm <- normalize_vsn(data_filt)
+
+cat("Normalization complete.\n")
+```
+
+```{r missing-summary-after-normalization}
+## Summarize missingness per sample after filtering and normalization.
+
+norm_mat <- assay(data_norm)
+
+miss_by_sample <- tibble::tibble(
+  sample_id = colnames(norm_mat),
+  frac_missing = colMeans(is.na(norm_mat))
+) %>%
+  dplyr::bind_cols(as.data.frame(colData(data_norm)))
+
+miss_by_sample %>%
+  dplyr::select(sample, condition, age, environment, sex, frac_missing) %>%
+  dplyr::arrange(desc(frac_missing)) %>%
+  print(n = Inf)
+```
+
+```{r plot-missing-after-normalization, fig.width=10, fig.height=5}
+## Plot missing-value fraction per sample after filtering and normalization.
+
+ggplot(miss_by_sample,
+       aes(x = reorder(sample, frac_missing),
+           y = frac_missing,
+           fill = sex)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw(base_size = 12) +
+  labs(
+    title = "Missing values per muscle sample after filtering and normalization",
+    x = NULL,
+    y = "Fraction missing"
+  )
+```
+
+```{r impute}
+## Impute remaining missing values using DEP2 left-censored imputation.
+
+data_imp <- impute(
+  data_norm,
+  fun = "MinProb",
+  q = 0.01
+)
+
+cat("Imputation complete.\n")
+cat("Missing values after imputation:", sum(is.na(assay(data_imp))), "\n")
+```
+
+# 9. PCA and sample correlation
+
+```{r pca-all-proteins, fig.width=7, fig.height=5}
+## Visualize global muscle proteome structure using all filtered, normalized, imputed proteins.
+
+mat_pca <- assay(data_imp)
+
+pca_all <- prcomp(
+  t(mat_pca),
+  center = TRUE,
+  scale. = TRUE
+)
+
+pca_var_all <- round(100 * (pca_all$sdev^2 / sum(pca_all$sdev^2)), 1)
+
+pca_df_all <- as.data.frame(pca_all$x[, 1:2]) %>%
+  tibble::rownames_to_column("sample_id") %>%
+  dplyr::bind_cols(as.data.frame(colData(data_imp)))
+
+ggplot(
+  pca_df_all,
+  aes(PC1, PC2, color = sex, shape = environment)
+) +
+  geom_point(size = 4) +
+  geom_text(aes(label = gsub("wk", "", age)), vjust = -0.8, size = 4) +
+  theme_bw(base_size = 13) +
+  labs(
+    title = "PCA using all filtered muscle proteins",
+    x = paste0("PC1 (", pca_var_all[1], "%)"),
+    y = paste0("PC2 (", pca_var_all[2], "%)")
+  )
+```
+
+```{r pca-top-variable, fig.width=7, fig.height=5}
+## Visualize PCA using the 500 most variable muscle proteins to assess dominant high-variance structure.
+
+vars <- apply(mat_pca, 1, var, na.rm = TRUE)
+top_n <- min(500, length(vars))
+top_proteins <- names(sort(vars, decreasing = TRUE))[1:top_n]
+
+pca_top <- prcomp(
+  t(mat_pca[top_proteins, ]),
+  center = TRUE,
+  scale. = TRUE
+)
+
+pca_var_top <- round(100 * (pca_top$sdev^2 / sum(pca_top$sdev^2)), 1)
+
+pca_df_top <- as.data.frame(pca_top$x[, 1:2]) %>%
+  tibble::rownames_to_column("sample_id") %>%
+  dplyr::bind_cols(as.data.frame(colData(data_imp)))
+
+ggplot(
+  pca_df_top,
+  aes(PC1, PC2, color = sex, shape = environment)
+) +
+  geom_point(size = 4) +
+  geom_text(aes(label = gsub("wk", "", age)), vjust = -0.8, size = 4) +
+  theme_bw(base_size = 13) +
+  labs(
+    title = "PCA using top 500 variable muscle proteins",
+    x = paste0("PC1 (", pca_var_top[1], "%)"),
+    y = paste0("PC2 (", pca_var_top[2], "%)")
+  )
+```
+
+```{r sample-correlation, fig.width=7, fig.height=6}
+## Plot sample-to-sample correlation to assess clustering and sample similarity.
+
+cor_mat <- cor(assay(data_imp), method = "pearson")
+
+anno <- as.data.frame(colData(data_imp)[, c("age", "environment", "sex", "condition")])
+
+pheatmap(
+  cor_mat,
+  annotation_col = anno,
+  annotation_row = anno,
+  show_colnames = FALSE,
+  show_rownames = FALSE,
+  main = "Muscle sample correlation"
+)
+```
+
+# 10. Additional analysis: variance contribution of biological factors
+
+This section is included because PCA suggested that sex is a major source of variation in muscle. Instead of relying only on PCA, this analysis estimates how much each term contributes to protein-level variation using partial R² from linear models.
+
+```{r partial-r2-functions}
+## Define helper functions to estimate partial R2 for sex, age, environment, and age-by-environment terms.
+
+get_partial_r2 <- function(y, meta) {
+  df <- data.frame(
+    y = as.numeric(y),
+    sex = meta$sex,
+    age = meta$age,
+    environment = meta$environment
+  )
+  
+  full <- lm(y ~ sex + age * environment, data = df)
+  rss_full <- sum(residuals(full)^2)
+  
+  reduced_sex <- lm(y ~ age * environment, data = df)
+  reduced_age <- lm(y ~ sex + environment + age:environment, data = df)
+  reduced_environment <- lm(y ~ sex + age + age:environment, data = df)
+  reduced_interaction <- lm(y ~ sex + age + environment, data = df)
+  
+  rss_sex <- sum(residuals(reduced_sex)^2)
+  rss_age <- sum(residuals(reduced_age)^2)
+  rss_environment <- sum(residuals(reduced_environment)^2)
+  rss_interaction <- sum(residuals(reduced_interaction)^2)
+  
+  c(
+    sex = (rss_sex - rss_full) / rss_sex,
+    age = (rss_age - rss_full) / rss_age,
+    environment = (rss_environment - rss_full) / rss_environment,
+    age_environment = (rss_interaction - rss_full) / rss_interaction
+  )
+}
+```
+
+```{r partial-r2-analysis, fig.width=7, fig.height=5}
+## Estimate and visualize partial R2 distributions for major experimental factors.
+
+meta_model <- as.data.frame(colData(data_imp))
+
+partial_r2_mat <- t(apply(assay(data_imp), 1, get_partial_r2, meta = meta_model))
+partial_r2_df <- as.data.frame(partial_r2_mat) %>%
+  tibble::rownames_to_column("Protein") %>%
+  tidyr::pivot_longer(-Protein, names_to = "Term", values_to = "Partial_R2")
+
+partial_r2_df$Term <- factor(
+  partial_r2_df$Term,
+  levels = c("sex", "age", "environment", "age_environment"),
+  labels = c("Sex", "Age", "Environment", "Age x Environment")
+)
+
+ggplot(partial_r2_df, aes(x = Term, y = Partial_R2, fill = Term)) +
+  geom_boxplot(outlier.alpha = 0.1) +
+  theme_bw(base_size = 13) +
+  labs(
+    title = "Protein-level variance explained by experimental factors",
+    x = NULL,
+    y = "Partial R²"
+  ) +
+  theme(legend.position = "none")
+```
+
+# 11. Limma model on DEP2-processed data
+
+The primary model adjusts for sex while testing age, environment, and the age-by-environment interaction. With 8-week Lab as the reference age/environment combination, the `age18wk` coefficient estimates the age effect in Lab, while the Mesocosm age effect is estimated as `age18wk + age18wk:environmentMesocosm`.
+
+```{r limma-model}
+## Fit sex-adjusted linear models to DEP2-processed muscle protein abundances.
+
+model_meta <- as.data.frame(colData(data_imp))
+model_meta$age <- factor(model_meta$age, levels = c("8wk", "18wk"))
+model_meta$environment <- factor(model_meta$environment, levels = c("Lab", "Mesocosm"))
+model_meta$sex <- factor(model_meta$sex, levels = c("Female", "Male"))
+
+design <- model.matrix(~ sex + age * environment, data = model_meta)
+
+colnames(design) <- make.names(colnames(design))
+colnames(design)
+
+fit <- lmFit(assay(data_imp), design)
+fit <- eBayes(fit)
+```
+
+```{r extract-age-effects}
+## Extract age effects in Lab, age effects in Mesocosm, and the age-by-environment interaction.
+
+age_lab <- topTable(
+  fit,
+  coef = "age18wk",
+  number = Inf,
+  sort.by = "none"
+)
+
+contrast_env_18wk <- rep(0, ncol(design))
+names(contrast_env_18wk) <- colnames(design)
+contrast_env_18wk["age18wk"] <- 1
+contrast_env_18wk["age18wk.environmentMesocosm"] <- 1
+
+fit_age_meso <- contrasts.fit(fit, contrasts = contrast_env_18wk)
+fit_age_meso <- eBayes(fit_age_meso)
+
+age_meso <- topTable(
+  fit_age_meso,
+  number = Inf,
+  sort.by = "none"
+)
+
+interaction_env_age <- topTable(
+  fit,
+  coef = "age18wk.environmentMesocosm",
+  number = Inf,
+  sort.by = "none"
+)
+
+cat("Age in Lab FDR <", FDR_CUTOFF, ":", sum(age_lab$adj.P.Val < FDR_CUTOFF), "\n")
+cat("Age in Mesocosm FDR <", FDR_CUTOFF, ":", sum(age_meso$adj.P.Val < FDR_CUTOFF), "\n")
+cat("Age x Environment FDR <", FDR_CUTOFF, ":", sum(interaction_env_age$adj.P.Val < FDR_CUTOFF), "\n")
+```
+
+```{r nominal-and-relaxed-fdr-counts}
+## Compare nominal and adjusted significance counts for age effects in each environment.
+
+cat("Lab p < 0.05:", sum(age_lab$P.Value < 0.05, na.rm = TRUE), "\n")
+cat("Mesocosm p < 0.05:", sum(age_meso$P.Value < 0.05, na.rm = TRUE), "\n")
+
+cat("Lab FDR < 0.05:", sum(age_lab$adj.P.Val < 0.05, na.rm = TRUE), "\n")
+cat("Lab FDR < 0.10:", sum(age_lab$adj.P.Val < 0.10, na.rm = TRUE), "\n")
+
+cat("Mesocosm FDR < 0.05:", sum(age_meso$adj.P.Val < 0.05, na.rm = TRUE), "\n")
+cat("Mesocosm FDR < 0.10:", sum(age_meso$adj.P.Val < 0.10, na.rm = TRUE), "\n")
+```
+
+# 12. Age-associated protein overlap
+
+```{r age-protein-overlap}
+## Identify proteins significantly associated with age in Lab, Mesocosm, or both.
+
+age_lab_sig <- rownames(age_lab[age_lab$adj.P.Val < FDR_CUTOFF, ])
+age_meso_sig <- rownames(age_meso[age_meso$adj.P.Val < FDR_CUTOFF, ])
+
+cat("Age in Lab:", length(age_lab_sig), "\n")
+cat("Age in Mesocosm:", length(age_meso_sig), "\n")
+cat("Overlap:", length(intersect(age_lab_sig, age_meso_sig)), "\n")
+```
+
+```{r top-meso-age-proteins}
+## Inspect the strongest age-associated proteins in Mesocosm muscle.
+
+age_meso %>%
+  dplyr::arrange(adj.P.Val) %>%
+  dplyr::select(logFC, P.Value, adj.P.Val) %>%
+  head(30)
+```
+
+# 13. Direct comparison of Lab and Mesocosm aging trajectories
+
+```{r age-effect-scatter-all, fig.width=6, fig.height=5}
+## Compare age-associated log2 fold changes between Lab and Mesocosm across all tested proteins.
+
+common_proteins <- intersect(rownames(age_lab), rownames(age_meso))
+
+age_effect_df <- data.frame(
+  Protein = common_proteins,
+  Lab_logFC = age_lab[common_proteins, "logFC"],
+  Meso_logFC = age_meso[common_proteins, "logFC"],
+  Lab_FDR = age_lab[common_proteins, "adj.P.Val"],
+  Meso_FDR = age_meso[common_proteins, "adj.P.Val"]
+)
+
+age_effect_df$Delta_logFC <- age_effect_df$Meso_logFC - age_effect_df$Lab_logFC
+age_effect_df$Abs_Delta_logFC <- abs(age_effect_df$Delta_logFC)
+
+cor_all <- cor(age_effect_df$Lab_logFC, age_effect_df$Meso_logFC, use = "complete.obs")
+
+ggplot(age_effect_df,
+       aes(x = Lab_logFC, y = Meso_logFC)) +
+  geom_point(alpha = 0.25, size = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2, linewidth = 1) +
+  geom_hline(yintercept = 0, linetype = 3, color = "grey50") +
+  geom_vline(xintercept = 0, linetype = 3, color = "grey50") +
+  theme_bw(base_size = 13) +
+  labs(
+    title = "Comparison of age effects in Lab and Mesocosm muscle",
+    subtitle = paste0("Pearson r = ", round(cor_all, 3)),
+    x = "Lab log2FC (18wk vs 8wk)",
+    y = "Mesocosm log2FC (18wk vs 8wk)"
+  )
+```
+
+```{r age-effect-magnitude-boxplot, fig.width=5.5, fig.height=5}
+## Compare the magnitude of age-associated effect sizes between environments.
+
+mag_df <- data.frame(
+  EffectSize = c(abs(age_effect_df$Lab_logFC), abs(age_effect_df$Meso_logFC)),
+  Environment = rep(c("Lab", "Mesocosm"), each = nrow(age_effect_df))
+)
+
+wilcox_mag <- wilcox.test(
+  abs(age_effect_df$Lab_logFC),
+  abs(age_effect_df$Meso_logFC),
+  paired = TRUE
+)
+
+y_pos <- max(mag_df$EffectSize, na.rm = TRUE) * 1.05
+
+ggplot(mag_df, aes(Environment, EffectSize)) +
+  geom_boxplot(width = 0.6, outlier.alpha = 0.2) +
+  annotate("segment", x = 1, xend = 2, y = y_pos, yend = y_pos) +
+  annotate("text", x = 1.5, y = y_pos * 1.03,
+           label = paste0("Wilcoxon p = ", format.pval(wilcox_mag$p.value, digits = 3)),
+           size = 4.5) +
+  theme_classic(base_size = 13) +
+  labs(
+    title = "Magnitude of age-associated muscle proteome changes",
+    x = NULL,
+    y = "|log2FC|"
+  )
+
+cat("Mean |logFC| Lab:", mean(abs(age_effect_df$Lab_logFC)), "\n")
+cat("Mean |logFC| Mesocosm:", mean(abs(age_effect_df$Meso_logFC)), "\n")
+cat("Median |logFC| Lab:", median(abs(age_effect_df$Lab_logFC)), "\n")
+cat("Median |logFC| Mesocosm:", median(abs(age_effect_df$Meso_logFC)), "\n")
+```
+
+```{r top-delta-proteins}
+## Identify proteins with the largest differences in aging trajectory between environments.
+
+age_effect_df %>%
+  dplyr::arrange(desc(Abs_Delta_logFC)) %>%
+  dplyr::select(Protein, Lab_logFC, Meso_logFC, Delta_logFC, Abs_Delta_logFC, Lab_FDR, Meso_FDR) %>%
+  head(30)
+```
+
+# 14. Ribosomal protein pattern in Mesocosm muscle aging
+
+```{r ribosomal-counts}
+## Quantify the ribosomal protein contribution to significant Mesocosm muscle aging proteins.
+
+meso_sig_df <- age_meso[age_meso$adj.P.Val < FDR_CUTOFF, ]
+meso_sig_df$Protein <- rownames(meso_sig_df)
+meso_sig_df$is_ribosomal <- grepl("^RPL|^RPS", meso_sig_df$Protein, ignore.case = FALSE)
+
+cat("Significant Mesocosm age proteins:", nrow(meso_sig_df), "\n")
+cat("Ribosomal proteins among significant Mesocosm hits:", sum(meso_sig_df$is_ribosomal), "\n")
+cat("Fraction ribosomal:", round(100 * mean(meso_sig_df$is_ribosomal), 1), "%\n")
+
+table(meso_sig_df$logFC > 0)
+```
+
+```{r ribosomal-barplot, fig.width=8, fig.height=6}
+## Plot significant Mesocosm age-associated proteins, highlighting ribosomal proteins.
+
+if (nrow(meso_sig_df) > 0) {
+  meso_sig_df %>%
+    dplyr::arrange(logFC) %>%
+    dplyr::mutate(Protein = factor(Protein, levels = Protein)) %>%
+    ggplot(aes(x = Protein, y = logFC, fill = is_ribosomal)) +
+    geom_col() +
+    coord_flip() +
+    theme_bw(base_size = 12) +
+    labs(
+      title = "Significant age-associated proteins in Mesocosm muscle",
+      x = NULL,
+      y = "log2FC (18wk vs 8wk)",
+      fill = "RPL/RPS protein"
+    )
+}
+```
+
+```{r ribosomal-logfc-distribution, fig.width=6, fig.height=5}
+## Compare age log2FC distributions for ribosomal and non-ribosomal proteins in Mesocosm muscle.
+
+ribosome_all_df <- age_effect_df %>%
+  dplyr::mutate(
+    is_ribosomal = grepl("^RPL|^RPS", Protein, ignore.case = FALSE)
+  )
+
+ggplot(ribosome_all_df,
+       aes(x = is_ribosomal, y = Meso_logFC, fill = is_ribosomal)) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  theme_bw(base_size = 13) +
+  labs(
+    title = "Mesocosm age effects in ribosomal vs non-ribosomal proteins",
+    x = "RPL/RPS protein",
+    y = "Mesocosm log2FC (18wk vs 8wk)"
+  ) +
+  theme(legend.position = "none")
+```
+
+# 15. Within-sex sensitivity analysis
+
+Because sex explains a large component of muscle proteome variation, this section checks whether the Mesocosm age signal is driven primarily by one sex. This is exploratory and should be interpreted as a sensitivity analysis rather than the main model.
+
+```{r within-sex-age-effects}
+## Run exploratory within-sex age effect models for Lab and Mesocosm separately.
+
+run_within_sex_age <- function(sex_level, environment_level) {
+  cols <- which(model_meta$sex == sex_level & model_meta$environment == environment_level)
+  sub_meta <- droplevels(model_meta[cols, ])
+  sub_mat <- assay(data_imp)[, cols, drop = FALSE]
+  
+  if (length(unique(sub_meta$age)) < 2) {
+    return(NULL)
+  }
+  
+  d <- model.matrix(~ age, data = sub_meta)
+  fit_sub <- lmFit(sub_mat, d)
+  fit_sub <- eBayes(fit_sub)
+  out <- topTable(fit_sub, coef = "age18wk", number = Inf, sort.by = "none")
+  out$Protein <- rownames(out)
+  out$sex <- sex_level
+  out$environment <- environment_level
+  out
+}
+
+within_sex_results <- bind_rows(
+  run_within_sex_age("Female", "Lab"),
+  run_within_sex_age("Female", "Mesocosm"),
+  run_within_sex_age("Male", "Lab"),
+  run_within_sex_age("Male", "Mesocosm")
+)
+
+within_sex_results %>%
+  dplyr::group_by(sex, environment) %>%
+  dplyr::summarise(
+    n_nominal = sum(P.Value < 0.05, na.rm = TRUE),
+    n_fdr_05 = sum(adj.P.Val < 0.05, na.rm = TRUE),
+    median_abs_logFC = median(abs(logFC), na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r within-sex-effectsize-plot, fig.width=7, fig.height=5}
+## Visualize within-sex age effect size distributions by environment.
+
+within_sex_results %>%
+  ggplot(aes(x = environment, y = abs(logFC), fill = environment)) +
+  geom_boxplot(outlier.alpha = 0.1) +
+  facet_wrap(~ sex) +
+  theme_bw(base_size = 13) +
+  labs(
+    title = "Within-sex magnitude of age effects in muscle",
+    x = NULL,
+    y = "|log2FC|"
+  ) +
+  theme(legend.position = "none")
+```
+
+# 16. Save core result tables
+
+```{r save-results}
+## Save key muscle analysis result tables for review and downstream interpretation.
+
+readr::write_csv(age_lab %>% tibble::rownames_to_column("Protein"),
+                 file.path(OUT_DIR, "muscle_age_lab_limma.csv"))
+readr::write_csv(age_meso %>% tibble::rownames_to_column("Protein"),
+                 file.path(OUT_DIR, "muscle_age_meso_limma.csv"))
+readr::write_csv(interaction_env_age %>% tibble::rownames_to_column("Protein"),
+                 file.path(OUT_DIR, "muscle_age_environment_interaction_limma.csv"))
+readr::write_csv(age_effect_df,
+                 file.path(OUT_DIR, "muscle_lab_vs_meso_age_effects.csv"))
+readr::write_csv(pgs_per_sample,
+                 file.path(OUT_DIR, "muscle_detected_proteins_per_sample.csv"))
+readr::write_csv(partial_r2_df,
+                 file.path(OUT_DIR, "muscle_partial_r2_by_protein.csv"))
+
+cat("Results saved in:", OUT_DIR, "\n")
+```
+
+# 17. Notes for interpretation
+
+The primary results should be interpreted in the context of the QC plots and the PCA. If sex remains the dominant global source of variation, age and environment effects should be interpreted as smaller effects detected after accounting for sex in the model. If the Mesocosm age effect produces more significant proteins than the Lab age effect but the interaction term is not significant, that pattern supports a cautious interpretation: age-associated remodeling may be more detectable or stronger in Mesocosm muscle, but the evidence for protein-by-protein differences in aging slopes between environments is limited after multiple-testing correction.
+
